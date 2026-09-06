@@ -34,7 +34,7 @@ app.use((req, res, next) => {
   if (req.path === "/login" || req.path === "/login.html") return next();
   if (!authed(req)) {
     if (req.path.startsWith("/api/")) return res.status(401).json({ error: "Sign in first" });
-    return res.sendFile(path.join(__dirname, "..", "public", "login.html"));
+    return res.sendFile(path.join(__dirname, "login.html"));
   }
   next();
 });
@@ -139,7 +139,7 @@ cron.schedule("0 8 * * 1", mondayRun, { timezone: process.env.TZ || "Asia/Bangko
 app.post("/api/run-monday-now", wrap(async (req, res) => { await mondayRun(); res.json({ ok: true }); }));
 
 /* ---------------------------------------------------------- static */
-app.use(express.static(path.join(__dirname, "..", "public")));
+app.get("/", (req, res) => res.sendFile(path.join(__dirname, "index.html")));
 
 const port = process.env.PORT || 8080;
 migrate().then(() => app.listen(port, () => console.log(`ledger on :${port}`)));
