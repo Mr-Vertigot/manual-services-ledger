@@ -166,12 +166,35 @@ export async function createGmailDraft({ to, subject, body }) {
   return res.data.id;
 }
 
-export async function sendGmail({ to, subject, body }) {
+export async function sendGmail({ to, cc, subject, body }) {
   const g = await gmail();
   const raw = Buffer.from(
-    `To: ${to}\r\nSubject: ${subject}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n${body}`
+    `To: ${to}\r\n${cc ? `Cc: ${cc}\r\n` : ""}Subject: ${subject}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n${body}`
   ).toString("base64url");
-  await g.users.messages.send({ userId: "me", requestBody: { raw } });
+  const res = await g.users.messages.send({ userId: "me", requestBody: { raw } });
+  return res.data.threadId;
+}
+
+/* replies to our tagged supplier emails, parsed into numbers */
+export async function readSupplierReplies(project, tag) {
+  const g = await gmail();
+  const list = await g.users.messages.list({ userId: "me", q: `"${tag}" -from:me newer_than:90d`, maxResults: 10 });
+  const ids = (list.data.messages || []).map((m) => m.id);
+  if (ids.length === 0) return null;
+  const texts = [];
+  for (const id of ids) {
+    const m = await g.users.messages.get({ userId: "me", id, format: "full" });
+    texts.push(`--- ${headerOf(m.data, "Date")} | from ${headerOf(m.data, "From")}\n${bodyText(m.data)}`);
+  }
+  const out = await askClaude(
+    `These are replies from our team about the project "${project.client}". Extract the numbers. Respond with ONLY JSON, no fences:
+{"audit": number or null, "vpat": number or null, "reaudit": number or null, "pdf": number or null, "devHours": number or null, "pmHours": number or null, "deliveredAt": "YYYY-MM-DD or empty", "note": "one line"}
+Only fill a field when a reply clearly states it. Quoted text from our own email does not count.
+
+REPLIES:
+${texts.join("\n\n")}`
+  );
+  return parseJSON(out);
 }
 
 /* ------------------------------------------------------ Stripe + Mercury */
@@ -236,4 +259,19 @@ Respond with ONLY JSON, no fences:
 {"matches":[{"client":"","stage":"deposit|balance|monitoring","amount":0,"date":"YYYY-MM-DD","source":"stripe|mercury","reference":"","certainty":"high|low"}],"unmatched":["one line per payment you could not match"],"note":"one line summary"}`
   );
   return parseJSON(text);
+}
+
+
+/* ---------------------------------------------------------- ChartMogul */
+export async function chartmogulMrr(clientName) {
+  const key = process.env.CHARTMOGUL_API_KEY;
+  if (!key) throw new Error("CHARTMOGUL_API_KEY is not configured on the server.");
+  const h = { Authorization: "Basic " + Buffer.from(`${key}:`).toString("base64") };
+  const q = encodeURIComponent(clientName);
+  const r = await fetch(`https://api.chartmogul.com/v1/customers/search?email=&external_id=&name=${q}`, { headers: h }).then((x) => x.json());
+  const cust = (r.entries || [])[0];
+  if (!cust) return { found: false };
+  const subs = await fetch(`https://api.chartmogul.com/v1/customers/${cust.uuid}/subscriptions`, { headers: h }).then((x) => x.json());
+  const mrr = (subs.entries || []).filter((x) => x.status === "active").reduce((a, x) => a + (x.mrr || 0) / 100, 0);
+  return { found: true, name: cust.name, mrr, customerUuid: cust.uuid };
 }
