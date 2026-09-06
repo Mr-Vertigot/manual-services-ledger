@@ -8,21 +8,10 @@
 <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
-<script src="https://unpkg.com/mammoth@1.6.0/mammoth.browser.min.js"></script>
 <style>body{margin:0}</style>
 </head>
 <body>
 <div id="root"></div>
-<script>
-  window.__IN_CLAUDE__ = false;
-  /* the Claude build has window.storage; on disk we use localStorage */
-  window.storage = {
-    async get(k){ const v = localStorage.getItem(k); if (v === null) throw new Error("not found"); return { key:k, value:v }; },
-    async set(k,v){ localStorage.setItem(k,v); return { key:k, value:v }; },
-    async delete(k){ localStorage.removeItem(k); return { key:k, deleted:true }; },
-    async list(prefix=""){ return { keys:Object.keys(localStorage).filter(k=>k.startsWith(prefix)) }; }
-  };
-</script>
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo, useRef } = React;
 
@@ -64,60 +53,12 @@ const DEFAULT_SETTINGS = {
   lastReconcile: "",
 };
 
-const MCP = {
-  gmail: { type: "url", url: "https://gmailmcp.googleapis.com/mcp/v1", name: "gmail" },
-  stripe: { type: "url", url: "https://mcp.stripe.com", name: "stripe" },
-  mercury: { type: "url", url: "https://mcp.mercury.com/mcp", name: "mercury" },
-};
 
-async function askClaude(content, servers = []) {
-  if (!window.__IN_CLAUDE__)
-    throw new Error("Gmail, Stripe and Mercury only work in the Claude app version. Everything else on this page works offline.");
-  const body = {
-    model: "claude-sonnet-4-6",
-    max_tokens: 1000,
-    messages: [{ role: "user", content }],
-  };
-  if (servers.length) body.mcp_servers = servers.map((s) => MCP[s]);
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const data = await res.json();
-
-  if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
-
-  const blocks = data.content || [];
-
-  /* an MCP call that failed auth comes back as a tool result, not an api error */
-  const toolErr = blocks.find(
-    (b) => b.type === "mcp_tool_result" && (b.is_error || /unauthor|forbidden|not connect|invalid.*token/i.test(JSON.stringify(b.content || "")))
-  );
-  if (toolErr) {
-    throw new Error(
-      `${toolErr.server_name || "The connector"} rejected the call: ${String(
-        toolErr.content?.[0]?.text || "authorisation failed"
-      ).slice(0, 200)}`
-    );
-  }
-
-  const text = blocks
-    .filter((b) => b.type === "text")
-    .map((b) => b.text)
-    .join("\n");
-
-  if (!text.trim()) {
-    const tried = blocks.filter((b) => b.type === "mcp_tool_use").map((b) => b.name);
-    throw new Error(
-      data.stop_reason === "max_tokens"
-        ? "Ran out of room mid-answer. Narrow the date range and try again."
-        : tried.length
-        ? `Called ${tried.join(", ")} but got no usable answer back.`
-        : "Empty response from the API."
-    );
-  }
-  return text;
+async function api(path, opts = {}) {
+  const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  return data;
 }
 
 function parseJSON(text) {
@@ -592,18 +533,15 @@ function Intake({ settings, onCreate }) {
   const [meta, setMeta] = useState(null);
   const fileRef = useRef(null);
 
-  async function callClaude(content) {
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 1000, messages: [{ role: "user", content }] }),
-    });
-    const data = await res.json();
-    const text = (data.content || [])
-      .filter((b) => b.type === "text")
-      .map((b) => b.text)
-      .join("\n");
-    return JSON.parse(text.replace(/```json|```/g, "").trim());
+  async function parseOnServer(file, text) {
+    const fd = new FormData();
+    fd.append("mode", mode);
+    if (file) fd.append("file", file);
+    if (text) fd.append("text", text);
+    const res = await fetch("/api/parse", { method: "POST", body: fd });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || "Parsing failed");
+    return data;
   }
 
   function applyParsed(parsed) {
@@ -628,39 +566,9 @@ function Intake({ settings, onCreate }) {
     setErr("");
     setStage("parsing");
     try {
-      let content;
-      if (file.type === "application/pdf") {
-        const b64 = await new Promise((res, rej) => {
-          const r = new FileReader();
-          r.onload = () => res(r.result.split(",")[1]);
-          r.onerror = () => rej(new Error("read failed"));
-          r.readAsDataURL(file);
-        });
-        content = [
-          { type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 } },
-          { type: "text", text: PROMPT },
-        ];
-      } else if (file.name.endsWith(".docx")) {
-        const buf = await file.arrayBuffer();
-        const { value } = await mammoth.extractRawText({ arrayBuffer: buf });
-        content = [{ type: "text", text: PROMPT + "\n\nSOURCE:\n" + value }];
-      } else if (/^image\//.test(file.type)) {
-        const b64 = await new Promise((res) => {
-          const r = new FileReader();
-          r.onload = () => res(r.result.split(",")[1]);
-          r.readAsDataURL(file);
-        });
-        content = [
-          { type: "image", source: { type: "base64", media_type: file.type, data: b64 } },
-          { type: "text", text: PROMPT },
-        ];
-      } else {
-        const text = await file.text();
-        content = [{ type: "text", text: PROMPT + "\n\nSOURCE:\n" + text }];
-      }
-      applyParsed(await callClaude(content));
+      applyParsed(await parseOnServer(file, null));
     } catch (e) {
-      setErr("That file could not be read. Try a PDF, or paste the terms below.");
+      setErr(e.message);
       setStage("idle");
     }
   }
@@ -670,9 +578,9 @@ function Intake({ settings, onCreate }) {
     setErr("");
     setStage("parsing");
     try {
-      applyParsed(await callClaude([{ type: "text", text: PROMPT + "\n\nSOURCE:\n" + pasted }]));
+      applyParsed(await parseOnServer(null, pasted));
     } catch (e) {
-      setErr("Nothing readable came back. Check the text and try again.");
+      setErr(e.message);
       setStage("idle");
     }
   }
@@ -873,13 +781,7 @@ function Detail({ p, settings, onChange, onDelete, onBack }) {
   async function findInvoices() {
     setLookup("Searching Gmail...");
     try {
-      const text = await askClaude(
-        `Search this Gmail account for invoices sent to the client "${p.client}" for accessibility services. The project fee is ${p.projectFee} and it is billed ${p.depositPct}% upfront and the rest on completion. Find the deposit invoice and the balance invoice. Respond with ONLY JSON, no fences:
-{"deposit":{"invoiceNo":"","invoicedAt":"YYYY-MM-DD","dueAt":"YYYY-MM-DD","paidAt":""},"balance":{"invoiceNo":"","invoicedAt":"","dueAt":"","paidAt":""},"note":"one line on what you found"}
-Use empty strings for anything you cannot find. Only set paidAt if an email clearly confirms payment was received.`,
-        ["gmail"]
-      );
-      const r = parseJSON(text);
+      const r = await api(`/api/projects/${p.id}/find-invoices`, { method: "POST" });
       set({
         deposit: { ...p.deposit, ...Object.fromEntries(Object.entries(r.deposit || {}).filter(([, v]) => v)) },
         balance: { ...p.balance, ...Object.fromEntries(Object.entries(r.balance || {}).filter(([, v]) => v)) },
@@ -1318,20 +1220,9 @@ function PaymentsTab({ projects, settings, setSettings, onOpen, onPatch }) {
     if (openItems.length === 0) { setStatus("Nothing outstanding to match."); return; }
     setStatus("Checking Stripe and Mercury...");
     try {
-      const wanted = openItems
-        .map((r) => `${r.p.client || "Untitled"} | ${r.label} | ${r.amt} | invoice ${r.inv.invoiceNo || "unknown"}`)
-        .join("\n");
-      const recurring = projects
-        .filter((p) => monitoringState(p) === "running")
-        .map((p) => `${p.client} | monitoring | ${p.monitoringMonthly} per month`)
-        .join("\n");
-      const text = await askClaude(
-        `List incoming payments received in the last 45 days from both Stripe and the Mercury bank account. Keep your answer compact, no commentary, at most 20 matches and 10 unmatched lines. Then match them against these outstanding invoices:\n\n${wanted}\n\nAlso watch for these recurring monthly monitoring charges:\n\n${recurring || "none running yet"}\n\nRespond with ONLY JSON, no fences:\n{"matches":[{"client":"","stage":"deposit|balance|monitoring","amount":0,"date":"YYYY-MM-DD","source":"stripe|mercury","reference":"payer name or invoice ref","certainty":"high|low"}],"unmatched":["one line per incoming payment you could not match"],"note":"one line summary"}\n\nMatch on amount and payer name. Do not guess: if a payment is close but not clearly the same client, put it in unmatched.`,
-        ["stripe", "mercury"]
-      );
-      const r = parseJSON(text);
+      const r = await api("/api/reconcile", { method: "POST" });
       setMatches(r.matches || []);
-      setStatus(r.note || `${(r.matches || []).length} possible matches, ${(r.unmatched || []).length} unmatched.`);
+      setStatus(r.note || `${r.paymentsSeen} payments seen, ${(r.matches || []).length} possible matches.`);
       setSettings({ ...settings, lastReconcile: today() });
     } catch (e) {
       setStatus(`Stripe / Mercury: ${e.message}`);
@@ -1464,14 +1355,9 @@ function TimesheetTab({ projects, settings, setSettings }) {
   const [preview, setPreview] = useState(null);
 
   async function draft(member) {
-    if (!member.email) { setStatus(`Add an email address for ${member.name} first.`); return; }
-    const mail = weeklyEmail(member, projects, settings);
     setStatus(`Creating a draft for ${member.name}...`);
     try {
-      await askClaude(
-        `Create a Gmail draft. To: ${member.email}. Subject: ${mail.subject}. Body exactly as follows, do not rewrite it:\n\n${mail.body}\n\nCreate the draft only. Do not send it. Reply with one short line confirming.`,
-        ["gmail"]
-      );
+      await api("/api/team/draft", { method: "POST", body: JSON.stringify({ memberId: member.id }) });
       setStatus(`Draft ready in Gmail for ${member.name}. Review it and hit send.`);
       setSettings({ ...settings, lastTimesheetRun: today() });
     } catch (e) {
@@ -1550,32 +1436,29 @@ function App() {
   const [loaded, setLoaded] = useState(false);
   const [saveNote, setSaveNote] = useState("");
 
+  const [gmailConnected, setGmailConnected] = useState(false);
+
   useEffect(() => {
     (async () => {
       try {
-        const p = await window.storage.get(KEY_PROJECTS);
-        if (p) setProjects(JSON.parse(p.value));
-      } catch (e) { /* first run */ }
-      try {
-        const s = await window.storage.get(KEY_SETTINGS);
-        if (s) setSettings({ ...DEFAULT_SETTINGS, ...JSON.parse(s.value) });
-      } catch (e) { /* first run */ }
+        const s = await api("/api/state");
+        setProjects(s.projects);
+        setSettings(s.settings);
+        setGmailConnected(s.gmailConnected);
+      } catch (e) {
+        setSaveNote(e.message);
+      }
       setLoaded(true);
     })();
   }, []);
 
+  /* settings save whenever they change */
   useEffect(() => {
     if (!loaded) return;
-    (async () => {
-      try {
-        await window.storage.set(KEY_PROJECTS, JSON.stringify(projects));
-        await window.storage.set(KEY_SETTINGS, JSON.stringify(settings));
-        setSaveNote("Saved " + new Date().toLocaleTimeString());
-      } catch (e) {
-        setSaveNote("Not saved, storage unavailable");
-      }
-    })();
-  }, [projects, settings, loaded]);
+    api("/api/settings", { method: "PUT", body: JSON.stringify(settings) })
+      .then(() => setSaveNote("Saved " + new Date().toLocaleTimeString()))
+      .catch((e) => setSaveNote("Not saved: " + e.message));
+  }, [settings, loaded]);
 
   const totals = useMemo(() => {
     return projects.reduce(
@@ -1606,7 +1489,24 @@ function App() {
   const cur = settings.currency;
   const sel = projects.find((p) => p.id === selected);
 
-  const upsert = (proj) => setProjects((ps) => ps.map((x) => (x.id === proj.id ? proj : x)));
+  const upsert = (proj) => {
+    setProjects((ps) => ps.map((x) => (x.id === proj.id ? proj : x)));
+    clearTimeout(upsert.t?.[proj.id]);
+    upsert.t = upsert.t || {};
+    upsert.t[proj.id] = setTimeout(() => {
+      api(`/api/projects/${proj.id}`, { method: "PUT", body: JSON.stringify(proj) })
+        .then(() => setSaveNote("Saved " + new Date().toLocaleTimeString()))
+        .catch((e) => setSaveNote("Not saved: " + e.message));
+    }, 400);
+  };
+  const create = async (p) => {
+    await api(`/api/projects/${p.id}`, { method: "PUT", body: JSON.stringify(p) });
+    setProjects((ps) => [p, ...ps]);
+  };
+  const remove = async (id) => {
+    await api(`/api/projects/${id}`, { method: "DELETE" });
+    setProjects((ps) => ps.filter((x) => x.id !== id));
+  };
 
   const TABS = [
     ["projects", "Projects"],
@@ -1630,7 +1530,14 @@ function App() {
               AccessibilityChecker.org &middot; what we sold, what it cost, who still owes us
             </p>
           </div>
-          <span style={{ fontFamily: MONO, fontSize: 10.5, color: C.ink3 }}>{saveNote}</span>
+          <div className="flex items-center gap-3">
+            {!gmailConnected && (
+              <a href="/auth/google" style={{ fontSize: 12, color: C.red, textDecoration: "none", border: `1px solid ${C.rule}`, padding: "5px 9px", borderRadius: 3, background: C.panel }}>
+                Connect Gmail
+              </a>
+            )}
+            <span style={{ fontFamily: MONO, fontSize: 10.5, color: C.ink3 }}>{saveNote}</span>
+          </div>
         </header>
 
         <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", marginBottom: 18 }}>
@@ -1670,7 +1577,7 @@ function App() {
         {tab === "intake" && (
           <Intake
             settings={settings}
-            onCreate={(p) => { setProjects((ps) => [p, ...ps]); setSelected(p.id); setTab("projects"); }}
+            onCreate={async (p) => { await create(p); setSelected(p.id); setTab("projects"); }}
           />
         )}
 
@@ -1680,7 +1587,7 @@ function App() {
             settings={settings}
             onChange={upsert}
             onBack={() => setSelected(null)}
-            onDelete={() => { setProjects((ps) => ps.filter((x) => x.id !== sel.id)); setSelected(null); }}
+            onDelete={async () => { await remove(sel.id); setSelected(null); }}
           />
         ) : (
           <Panel title={`${projects.length} project${projects.length === 1 ? "" : "s"}`} pad={false}
