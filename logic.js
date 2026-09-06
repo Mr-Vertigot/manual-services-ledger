@@ -246,3 +246,23 @@ export {
   uid, num, today, thisMonth, daysBetween, monthName, money,
   newProject, monitoringState, paymentState, referralFor, pnl, tasksFor, cashFlow, supplierEmail,
 };
+
+/* upgrade projects saved under an older shape */
+function normalize(p) {
+  const d = newProject();
+  const costs = Object.fromEntries(Object.keys(d.costs).map((k) => [k, { ...d.costs[k], ...((p.costs || {})[k] || {}) }]));
+  return {
+    ...d, ...p,
+    services: { ...d.services, ...(p.services || {}) },
+    costs,
+    lead: { ...d.lead, ...(p.lead || {}) },
+    deposit: { ...d.deposit, ...(p.deposit || {}) },
+    balance: { ...d.balance, ...(p.balance || {}) },
+    upsellCall: { ...d.upsellCall, ...(p.upsellCall || {}) },
+    monitoringLog: Array.isArray(p.monitoringLog) ? p.monitoringLog : [],
+    requests: p.requests || {},
+    deliveredAt: p.deliveredAt || "",
+    closed: !!p.closed || p.status === "closed",
+  };
+}
+export { normalize };
