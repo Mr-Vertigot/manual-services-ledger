@@ -15,57 +15,24 @@
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo, useRef } = React;
 
-/* ------------------------------------------------------------------ tokens */
-const C = {
-  bg: "#EFF2F1",
-  panel: "#FFFFFF",
-  ink: "#131C19",
-  ink2: "#57635F",
-  ink3: "#8A9490",
-  rule: "#DCE3E0",
-  green: "#0B6B53",
-  greenSoft: "#E2F0EB",
-  red: "#A93520",
-  redSoft: "#F8E7E3",
-  amber: "#8A6608",
-  amberSoft: "#F7EFDB",
-  slate: "#2B4A5E",
-  slateSoft: "#E6EDF2",
-};
-const MONO = 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace';
-const SANS = 'ui-sans-serif, system-ui, "Segoe UI", Helvetica, Arial, sans-serif';
-
-const KEY_PROJECTS = "ace:remediation:projects";
-const KEY_SETTINGS = "ace:remediation:settings";
+/* logic is injected below this line by the build step */
+/* shared between server and browser: pure functions only, no React */
 
 const DEFAULT_SETTINGS = {
   currency: "$",
   rateDev: 30,
-  pmPct: 5,
-  salesPct: 10,
+  ratePm: 25,
   termsDays: 7,
   team: [
-    { id: "pm", role: "Project management", name: "Casandra Visser", email: "" },
-    { id: "auditor", role: "Manual audit and VPAT", name: "Ritvik", email: "" },
-    { id: "dev", role: "Developer", name: "Igor", email: "" },
+    { id: "cas", role: "Project management", name: "Casandra Visser", email: "" },
+    { id: "ritvik", role: "Manual audit and VPAT", name: "Ritvik", email: "" },
+    { id: "denis", role: "Developer", name: "Denis", email: "" },
   ],
-  lastTimesheetRun: "",
+  referralRules: [],   /* { match: "nolan", partner: "Nolan Klein", type: "pct" | "fixed", value: 20 } */
+  autoEmails: true,
   lastReconcile: "",
+  lastMonday: "",
 };
-
-
-async function api(path, opts = {}) {
-  const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
-  return data;
-}
-
-function parseJSON(text) {
-  const clean = text.replace(/```json|```/g, "").trim();
-  const start = clean.indexOf("{");
-  return JSON.parse(start > 0 ? clean.slice(start) : clean);
-}
 
 const SERVICE_LABELS = {
   remediation: "Remediation",
@@ -77,22 +44,16 @@ const SERVICE_LABELS = {
 const ONE_TIME = ["remediation", "audit", "vpat", "pdf"];
 const SHORT = { remediation: "REM", audit: "AUDIT", vpat: "VPAT", pdf: "PDF", monitoring: "MON" };
 
-/* ------------------------------------------------------------------ helpers */
 const uid = () => Math.random().toString(36).slice(2, 10);
 const num = (v) => (isNaN(parseFloat(v)) ? 0 : parseFloat(v));
 const today = () => new Date().toISOString().slice(0, 10);
 const thisMonth = () => today().slice(0, 7);
-const daysBetween = (a, b) =>
-  Math.round((new Date(b) - new Date(a)) / 86400000);
-const monthName = (m) =>
-  new Date(m + "-02").toLocaleDateString("en-US", { month: "short", year: "numeric" });
+const daysBetween = (a, b) => Math.round((new Date(b) - new Date(a)) / 86400000);
+const monthName = (m) => new Date(m + "-02").toLocaleDateString("en-US", { month: "short", year: "numeric" });
 
 function money(v, cur = "$") {
   const n = num(v);
-  const s = Math.abs(n).toLocaleString("en-US", {
-    minimumFractionDigits: 0,
-    maximumFractionDigits: 0,
-  });
+  const s = Math.abs(n).toLocaleString("en-US", { maximumFractionDigits: 0 });
   return (n < 0 ? "-" : "") + cur + s;
 }
 
@@ -101,325 +62,247 @@ function newProject(partial = {}) {
     id: uid(),
     client: "",
     contractDate: today(),
-    status: "active",
+    closed: false,
     services: { remediation: true, audit: false, vpat: false, pdf: false, monitoring: false },
     projectFee: 0,
     depositPct: 50,
     monitoringMonthly: 0,
-    monitoringMonths: 12,
-    monitoringStartsAt: "",
-    monitoringLog: [],
-    lead: { source: "", partner: "", feeType: "pct", feeValue: 0, feePaid: false },
-    auditCost: 0,
-    vpatCost: 0,
-    pdfCost: 0,
-    devLog: [],
-    devRateOverride: null,
-    deposit: { invoiceNo: "", invoicedAt: "", dueAt: "", paidAt: "" },
-    balance: { invoiceNo: "", invoicedAt: "", dueAt: "", paidAt: "" },
+    lead: { source: "", partner: "" },
+    costs: {
+      audit: { amount: 0, paidAt: "", note: "" },
+      vpat: { amount: 0, paidAt: "", note: "" },
+      pdf: { amount: 0, paidAt: "", note: "" },
+      dev: { hours: 0, paidAt: "", note: "" },
+      pm: { hours: 0, paidAt: "", note: "" },
+      referral: { amount: 0, paidAt: "", note: "" },
+      sales: { amount: 0, paidAt: "", note: "" },
+    },
+    deposit: { paidAt: "", invoiceNo: "", invoicedAt: "" },
+    balance: { paidAt: "", invoiceNo: "", invoicedAt: "" },
     deliveredAt: "",
+    monitoringLog: [],
+    requests: {},
     upsellCall: { bookedAt: "", outcome: "" },
     notes: "",
     ...partial,
   };
 }
 
-function devRate(p, s) {
-  return p.devRateOverride === null || p.devRateOverride === "" ? num(s.rateDev) : num(p.devRateOverride);
-}
-
-function devHours(p) {
-  return (p.devLog || []).reduce((a, e) => a + num(e.hours), 0);
-}
-
-/* monitoring cannot run before the one-time work is handed over */
 function monitoringState(p) {
   if (!p.services.monitoring) return "none";
-  if (!p.deliveredAt) return "pending";
-  const start = p.monitoringStartsAt || p.deliveredAt;
-  return start > today() ? "pending" : "running";
+  if (!p.deliveredAt || p.deliveredAt > today()) return "pending";
+  return "running";
 }
 
-function dueDate(inv, s) {
-  if (!inv) return "";
-  if (inv.dueAt) return inv.dueAt;
-  if (!inv.invoicedAt) return "";
-  const d = new Date(inv.invoicedAt);
-  d.setDate(d.getDate() + num(s.termsDays));
-  return d.toISOString().slice(0, 10);
+function paymentState(p) {
+  const fee = num(p.projectFee);
+  const deposit = (fee * num(p.depositPct)) / 100;
+  if (!p.deposit.paidAt && deposit > 0) return "awaiting-deposit";
+  if (!p.balance.paidAt && fee - deposit > 0) return "balance-remaining";
+  return "paid";
 }
+const STATE_LABEL = { "awaiting-deposit": "Awaiting deposit", "balance-remaining": "Balance remaining", paid: "Paid in full" };
 
-function overdueBy(inv, s) {
-  const due = dueDate(inv, s);
-  return due ? daysBetween(due, today()) : null;
+function referralFor(p, s) {
+  if (num(p.costs.referral.amount)) return num(p.costs.referral.amount);
+  const src = `${p.lead.source} ${p.lead.partner}`.toLowerCase();
+  const rule = (s.referralRules || []).find((r) => r.match && src.includes(r.match.toLowerCase()));
+  if (!rule) return 0;
+  return rule.type === "pct" ? (num(p.projectFee) * num(rule.value)) / 100 : num(rule.value);
 }
 
 function pnl(p, s) {
-  const dr = devRate(p, s);
-  const dh = devHours(p);
-
-  /* ---- one time: remediation, manual audit, VPAT, PDF remediation ---- */
+  const c = p.costs;
   const fee = num(p.projectFee);
-  const referral =
-    p.lead.feeType === "pct" ? (fee * num(p.lead.feeValue)) / 100 : num(p.lead.feeValue);
-  const audit = num(p.auditCost);
-  const vpat = num(p.vpatCost);
-  const pdf = num(p.pdfCost);
-  const dev = dh * dr;
-  const labor = audit + vpat + pdf + dev;
-  const pm = (fee * num(s.pmPct)) / 100;
-  const sales = (fee * num(s.salesPct)) / 100;
-  const overhead = pm + sales;
-  const cost = referral + labor + overhead;
+  const audit = p.services.audit || p.services.remediation ? num(c.audit.amount) : 0;
+  const vpat = p.services.vpat ? num(c.vpat.amount) : 0;
+  const pdf = p.services.pdf ? num(c.pdf.amount) : 0;
+  const dev = num(c.dev.hours) * num(s.rateDev);
+  const pm = num(c.pm.hours) * num(s.ratePm);
+  const referral = referralFor(p, s);
+  const sales = num(c.sales.amount);
+  const cost = audit + vpat + pdf + dev + pm + referral + sales;
   const margin = fee - cost;
 
-  /* ---- ongoing: monitoring, one row per month actually served ---- */
   const mFee = num(p.monitoringMonthly);
-  const state = monitoringState(p);
   const log = p.monitoringLog || [];
-  const mHours = log.reduce((a, e) => a + num(e.hours), 0);
   const mRevenue = log.length * mFee;
-  const mLabor = mHours * dr;
-  const mOverhead = (mRevenue * (num(s.pmPct) + num(s.salesPct))) / 100;
-  const mCost = mLabor + mOverhead;
+  const mCost = log.reduce((a, e) => a + num(e.hours), 0) * num(s.rateDev);
   const mMargin = mRevenue - mCost;
-  const mCollected = log.filter((e) => e.paidAt).length * mFee;
-  const mOutstanding = mRevenue - mCollected;
-
-  /* typical month, for the MRR view */
-  const mAvgHours = log.length ? mHours / log.length : 0;
-  const mMonthMargin = mFee - mAvgHours * dr - (mFee * (num(s.pmPct) + num(s.salesPct))) / 100;
 
   const deposit = (fee * num(p.depositPct)) / 100;
   const balance = fee - deposit;
   const collected = (p.deposit.paidAt ? deposit : 0) + (p.balance.paidAt ? balance : 0);
+  const state = monitoringState(p);
 
   return {
-    fee, referral, labor, audit, vpat, pdf, dev, dh, dr, pm, sales, overhead, cost, margin,
+    fee, audit, vpat, pdf, dev, pm, referral, sales, cost, margin,
     marginPct: fee ? (margin / fee) * 100 : 0,
-    state, mFee, mHours, mRevenue, mLabor, mOverhead, mCost, mMargin, mCollected, mOutstanding,
-    mMonths: log.length, mAvgHours, mMonthMargin,
-    mMarginPct: mRevenue ? (mMargin / mRevenue) * 100 : 0,
+    mFee, mRevenue, mCost, mMargin, mMonths: log.length, state,
     mrr: state === "running" ? mFee : 0,
     pendingMrr: state === "pending" ? mFee : 0,
-    deposit, balance, collected,
-    outstanding: fee - collected + mOutstanding,
-    oneTimeOutstanding: fee - collected,
+    deposit, balance, collected, outstanding: fee - collected,
   };
 }
-
-/* month by month, one time recognised on handover, monitoring on the month served */
-function monthlyPnl(projects, s) {
-  const rows = {};
-  const touch = (m) =>
-    (rows[m] = rows[m] || { month: m, oneRev: 0, oneCost: 0, monRev: 0, monCost: 0 });
-
-  projects.forEach((p) => {
-    const n = pnl(p, s);
-    if (p.deliveredAt && n.fee) {
-      const r = touch(p.deliveredAt.slice(0, 7));
-      r.oneRev += n.fee;
-      r.oneCost += n.cost;
-    }
-    (p.monitoringLog || []).forEach((e) => {
-      if (!e.month) return;
-      const r = touch(e.month);
-      r.monRev += n.mFee;
-      r.monCost += num(e.hours) * n.dr + (n.mFee * (num(s.pmPct) + num(s.salesPct))) / 100;
-    });
-  });
-
-  return Object.values(rows)
-    .map((r) => ({
-      ...r,
-      oneMargin: r.oneRev - r.oneCost,
-      monMargin: r.monRev - r.monCost,
-      total: r.oneRev - r.oneCost + (r.monRev - r.monCost),
-      rev: r.oneRev + r.monRev,
-    }))
-    .sort((a, b) => (a.month < b.month ? 1 : -1));
-}
-
 
 function tasksFor(p, s) {
   const out = [];
-  const k = (t) => `${p.id}:${t}`;
-  if (p.status === "closed") return out;
+  if (p.closed) return out;
   const n = pnl(p, s);
+  const k = (t) => `${p.id}:${t}`;
 
-  if (!p.deposit.paidAt && n.deposit > 0) {
-    const od = overdueBy(p.deposit, s);
-    out.push({
-      key: k("deposit"),
-      level: od > 0 ? "red" : "amber",
-      title: `Deposit unpaid: ${money(n.deposit, s.currency)}`,
-      detail: p.deposit.invoicedAt
-        ? `Invoice ${p.deposit.invoiceNo || "?"} due ${dueDate(p.deposit, s)}, ${od > 0 ? `${od} days overdue` : `due in ${-od} days`}.`
-        : "Not invoiced yet. Work should not start before the deposit lands.",
-      project: p,
-    });
-  }
+  if (!p.deposit.paidAt && n.deposit > 0)
+    out.push({ key: k("deposit"), level: "amber", title: `Deposit unpaid ${money(n.deposit, s.currency)}`, project: p });
 
-  if (p.status === "delivered" && !p.balance.paidAt) {
-    const od = overdueBy(p.balance, s);
+  if (p.deliveredAt && !p.balance.paidAt && n.balance > 0) {
+    const inv = p.balance.invoicedAt;
     out.push({
       key: k("balance"),
-      level: od > 0 ? "red" : "amber",
-      title: `Balance unpaid: ${money(n.balance, s.currency)}`,
-      detail: p.balance.invoicedAt
-        ? `Invoice ${p.balance.invoiceNo || "?"} due ${dueDate(p.balance, s)}, ${od > 0 ? `${od} days overdue` : `due in ${-od} days`}.`
-        : "Delivered but the balance has not been invoiced.",
+      level: inv && daysBetween(inv, today()) > s.termsDays ? "red" : "amber",
+      title: inv ? `Balance overdue ${money(n.balance, s.currency)}` : `Invoice the balance ${money(n.balance, s.currency)}`,
       project: p,
     });
   }
 
-  if (p.status === "delivered" && !p.services.monitoring && !p.upsellCall.bookedAt) {
-    out.push({
-      key: k("upsell"),
-      level: "slate",
-      title: "Book the monitoring call",
-      detail:
-        "No monitoring on this contract. Sales should call before the site drifts out of compliance: core updates, plugin updates and client edits are not covered once remediation ends.",
-      project: p,
-    });
-  }
+  if (p.deliveredAt && !p.services.monitoring && !p.upsellCall.bookedAt)
+    out.push({ key: k("upsell"), level: "slate", title: "Book the monitoring call", project: p });
 
-  if (p.services.monitoring && p.status !== "draft") {
-    const st = monitoringState(p);
-    if (st === "pending") {
-      out.push({
-        key: k("monitoring-pending"),
-        level: "slate",
-        title: `Monitoring signed but not started: ${money(n.mFee, s.currency)}/mo`,
-        detail: p.deliveredAt
-          ? `Starts ${p.monitoringStartsAt || p.deliveredAt}. Not counted in MRR until then.`
-          : "Starts once remediation is handed over. Not counted in MRR yet.",
-        project: p,
-      });
-    } else if (st === "running" && !(p.monitoringLog || []).some((e) => e.month === thisMonth())) {
-      out.push({
-        key: k("monitoring"),
-        level: "green",
-        title: `Log ${monthName(thisMonth())} monitoring for ${p.client || "this client"}`,
-        detail: `${money(n.mFee, s.currency)}/mo. Run the scan, fix what it finds, then log the dev hours so the month has a real margin.`,
-        project: p,
-      });
-    }
-  }
+  if (monitoringState(p) === "running" && !(p.monitoringLog || []).some((e) => e.month === thisMonth()))
+    out.push({ key: k("mon"), level: "green", title: `Log ${monthName(thisMonth())} monitoring hours`, project: p });
 
-  if (p.lead.partner && !p.lead.feePaid && num(n.referral) > 0 && p.deposit.paidAt) {
-    out.push({
-      key: k("referral"),
-      level: "amber",
-      title: `Referral fee owed to ${p.lead.partner}: ${money(n.referral, s.currency)}`,
-      detail: "Deposit has landed, so the payout is due.",
-      project: p,
-    });
-  }
   return out;
 }
 
-/* ------------------------------------------------------------------ atoms */
-function Field({ label, hint, children }) {
-  return (
-    <label className="flex flex-col gap-1">
-      <span
-        className="uppercase"
-        style={{ fontFamily: MONO, fontSize: 10, letterSpacing: ".08em", color: C.ink3 }}
-      >
-        {label}
-      </span>
-      {children}
-      {hint && (
-        <span style={{ fontSize: 11, color: C.ink3 }}>{hint}</span>
-      )}
-    </label>
-  );
+function cashFlow(projects, s) {
+  const rows = {};
+  const touch = (m) => (rows[m] = rows[m] || { month: m, in: 0, out: 0, lines: [] });
+  const add = (date, amt, label, dir) => {
+    if (!date || !amt) return;
+    const r = touch(date.slice(0, 7));
+    r[dir] += amt;
+    r.lines.push({ date, amt, label, dir });
+  };
+
+  projects.forEach((p) => {
+    const n = pnl(p, s);
+    const who = p.client || "Untitled";
+    add(p.deposit.paidAt, n.deposit, `${who}, deposit`, "in");
+    add(p.balance.paidAt, n.balance, `${who}, balance`, "in");
+    (p.monitoringLog || []).forEach((e) => add(e.paidAt, n.mFee, `${who}, monitoring ${monthName(e.month)}`, "in"));
+
+    const c = p.costs;
+    add(c.audit.paidAt, n.audit, `${who}, audit, Ritvik`, "out");
+    add(c.vpat.paidAt, n.vpat, `${who}, VPAT, Ritvik`, "out");
+    add(c.pdf.paidAt, n.pdf, `${who}, PDF`, "out");
+    add(c.dev.paidAt, n.dev, `${who}, dev, Denis`, "out");
+    add(c.pm.paidAt, n.pm, `${who}, PM, Cas`, "out");
+    add(c.referral.paidAt, n.referral, `${who}, referral, ${p.lead.partner || "partner"}`, "out");
+    add(c.sales.paidAt, n.sales, `${who}, sales fee`, "out");
+  });
+
+  return Object.values(rows)
+    .map((r) => ({ ...r, net: r.in - r.out, lines: r.lines.sort((a, b) => (a.date < b.date ? -1 : 1)) }))
+    .sort((a, b) => (a.month < b.month ? 1 : -1));
 }
 
-const inputStyle = {
-  fontFamily: SANS,
-  fontSize: 13,
-  color: C.ink,
-  background: C.panel,
-  border: `1px solid ${C.rule}`,
-  borderRadius: 3,
-  padding: "7px 9px",
-  width: "100%",
-  outline: "none",
+/* -------------------------------------------------- supplier emails */
+const TAG = (p) => `[Ledger ${p.id}]`;
+
+function supplierEmail(kind, p, member, cc) {
+  const sold = Object.keys(SERVICE_LABELS).filter((k) => p.services[k]).map((k) => SERVICE_LABELS[k]).join(", ");
+  const who = p.client || "the client";
+  const first = (member.name || "").split(" ")[0];
+
+  if (kind === "ritvik") {
+    return {
+      to: member.email,
+      cc: cc?.email || "",
+      subject: `${who}: audit cost for the P&L ${TAG(p)}`,
+      body:
+`Hi ${first},
+
+This is an automated email from the manual services P&L Danny built.
+
+New project: ${who}
+Sold: ${sold}
+
+For the P&L I need your cost on this one:
+- Manual audit: $
+${p.services.vpat ? "- VPAT: $\n" : ""}- Re-audit or QA rounds, if any: $
+
+Reply to this email with the numbers, one per line. Nothing else needed.
+
+Thanks`,
+    };
+  }
+
+  return {
+    to: member.email,
+    cc: cc?.email || "",
+    subject: `${who}: hours for the P&L ${TAG(p)}`,
+    body:
+`Hi ${first},
+
+This is an automated email from the manual services P&L Danny built.
+
+Project: ${who}
+Sold: ${sold}
+
+Reply with:
+- Denis dev hours so far: 
+- Your project management hours so far: 
+${p.services.pdf ? "- PDF remediation cost: $\n" : ""}- Handed over to the client? (yes/no, and the date if yes)
+
+One number per line. Nothing else needed.
+
+Thanks`,
+  };
+}
+
+
+
+/* ------------------------------------------------------------------ tokens */
+const C = {
+  bg: "#EFF2F1", panel: "#FFFFFF", ink: "#131C19", ink2: "#57635F", ink3: "#8A9490", rule: "#DCE3E0",
+  green: "#0B6B53", greenSoft: "#E2F0EB", red: "#A93520", redSoft: "#F8E7E3",
+  amber: "#8A6608", amberSoft: "#F7EFDB", slate: "#2B4A5E", slateSoft: "#E6EDF2",
 };
+const MONO = 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace';
+const SANS = 'ui-sans-serif, system-ui, "Segoe UI", Helvetica, Arial, sans-serif';
 
-function TextIn(props) {
-  return <input {...props} style={{ ...inputStyle, ...(props.style || {}) }} />;
-}
-function NumIn(props) {
-  return (
-    <input
-      {...props}
-      type="number"
-      style={{ ...inputStyle, fontFamily: MONO, textAlign: "right", ...(props.style || {}) }}
-    />
-  );
+async function api(path, opts = {}) {
+  const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  return data;
 }
 
+/* ------------------------------------------------------------------ atoms */
+const inputStyle = { fontFamily: SANS, fontSize: 13, color: C.ink, background: C.panel, border: `1px solid ${C.rule}`, borderRadius: 3, padding: "7px 9px", width: "100%", outline: "none" };
+const TextIn = (p) => <input {...p} style={{ ...inputStyle, ...(p.style || {}) }} />;
+const NumIn = (p) => <input {...p} type="number" style={{ ...inputStyle, fontFamily: MONO, textAlign: "right", ...(p.style || {}) }} />;
+const Field = ({ label, children }) => (
+  <label className="flex flex-col gap-1">
+    <span style={{ fontFamily: MONO, fontSize: 10, letterSpacing: ".08em", textTransform: "uppercase", color: C.ink3 }}>{label}</span>
+    {children}
+  </label>
+);
 function Chip({ tone = "slate", children }) {
-  const map = {
-    green: [C.greenSoft, C.green],
-    red: [C.redSoft, C.red],
-    amber: [C.amberSoft, C.amber],
-    slate: [C.slateSoft, C.slate],
-  };
-  const [bg, fg] = map[tone] || map.slate;
-  return (
-    <span
-      style={{
-        background: bg, color: fg, fontFamily: MONO, fontSize: 10,
-        letterSpacing: ".06em", textTransform: "uppercase",
-        padding: "3px 6px", borderRadius: 3, whiteSpace: "nowrap",
-      }}
-    >
-      {children}
-    </span>
-  );
+  const m = { green: [C.greenSoft, C.green], red: [C.redSoft, C.red], amber: [C.amberSoft, C.amber], slate: [C.slateSoft, C.slate] };
+  const [bg, fg] = m[tone] || m.slate;
+  return <span style={{ background: bg, color: fg, fontFamily: MONO, fontSize: 10, letterSpacing: ".06em", textTransform: "uppercase", padding: "3px 6px", borderRadius: 3, whiteSpace: "nowrap" }}>{children}</span>;
 }
-
 function Btn({ kind = "ghost", children, ...rest }) {
-  const base = {
-    fontFamily: SANS, fontSize: 12.5, fontWeight: 500, padding: "7px 12px",
-    borderRadius: 3, cursor: "pointer", border: `1px solid ${C.rule}`,
-    background: C.panel, color: C.ink,
-  };
-  const kinds = {
-    primary: { background: C.ink, color: "#fff", border: `1px solid ${C.ink}` },
-    good: { background: C.green, color: "#fff", border: `1px solid ${C.green}` },
-    ghost: {},
-    danger: { color: C.red, border: `1px solid ${C.rule}` },
-  };
-  return (
-    <button {...rest} style={{ ...base, ...kinds[kind], ...(rest.style || {}) }}>
-      {children}
-    </button>
-  );
+  const base = { fontFamily: SANS, fontSize: 12.5, fontWeight: 500, padding: "7px 12px", borderRadius: 3, cursor: "pointer", border: `1px solid ${C.rule}`, background: C.panel, color: C.ink };
+  const kinds = { primary: { background: C.ink, color: "#fff", border: `1px solid ${C.ink}` }, good: { background: C.green, color: "#fff", border: `1px solid ${C.green}` }, ghost: {}, danger: { color: C.red } };
+  return <button {...rest} style={{ ...base, ...kinds[kind], ...(rest.style || {}) }}>{children}</button>;
 }
-
 function Panel({ title, right, children, pad = true }) {
   return (
-    <section
-      style={{ background: C.panel, border: `1px solid ${C.rule}`, borderRadius: 4 }}
-    >
+    <section style={{ background: C.panel, border: `1px solid ${C.rule}`, borderRadius: 4 }}>
       {title && (
-        <header
-          className="flex items-center justify-between"
-          style={{ borderBottom: `1px solid ${C.rule}`, padding: "9px 14px" }}
-        >
-          <h2
-            style={{
-              fontFamily: MONO, fontSize: 10.5, letterSpacing: ".1em",
-              textTransform: "uppercase", color: C.ink2,
-            }}
-          >
-            {title}
-          </h2>
+        <header className="flex items-center justify-between" style={{ borderBottom: `1px solid ${C.rule}`, padding: "9px 14px" }}>
+          <h2 style={{ fontFamily: MONO, fontSize: 10.5, letterSpacing: ".1em", textTransform: "uppercase", color: C.ink2 }}>{title}</h2>
           {right}
         </header>
       )}
@@ -427,261 +310,98 @@ function Panel({ title, right, children, pad = true }) {
     </section>
   );
 }
-
-/* the signature element: a margin ribbon that reads left to right as money leaves */
-function MarginRibbon({ n, cur }) {
-  if (!n.fee) return <div style={{ height: 26, background: C.bg, borderRadius: 3 }} />;
-  const segs = [
-    { label: "Referral", v: n.referral, c: "#8C6D3F" },
-    { label: "Labor", v: n.labor, c: C.slate },
-    { label: "PM + sales", v: n.overhead, c: "#7A8B86" },
-    { label: "Margin", v: Math.max(n.margin, 0), c: C.green },
-  ].filter((s) => s.v > 0);
-  const total = Math.max(n.fee, n.cost);
+function Row({ label, value, strong, tone, onClick }) {
   return (
-    <div>
-      <div className="flex" style={{ height: 26, borderRadius: 3, overflow: "hidden" }}>
-        {segs.map((s) => (
-          <div
-            key={s.label}
-            title={`${s.label} ${money(s.v, cur)}`}
-            style={{
-              width: `${(s.v / total) * 100}%`,
-              background: s.c,
-              borderRight: "1px solid rgba(255,255,255,.5)",
-            }}
-          />
-        ))}
-        {n.margin < 0 && (
-          <div style={{ width: `${(-n.margin / total) * 100}%`, background: C.red }} />
-        )}
-      </div>
-      <div className="flex flex-wrap gap-x-4 gap-y-1 mt-2">
-        {segs.map((s) => (
-          <span key={s.label} className="flex items-center gap-1.5" style={{ fontSize: 11, color: C.ink2 }}>
-            <i style={{ width: 8, height: 8, background: s.c, borderRadius: 2, display: "inline-block" }} />
-            {s.label}
-            <b style={{ fontFamily: MONO, fontWeight: 500 }}>{money(s.v, cur)}</b>
-          </span>
-        ))}
-      </div>
+    <div onClick={onClick} className="flex items-baseline justify-between gap-4" style={{ padding: "6px 0", borderBottom: `1px solid ${C.rule}`, cursor: onClick ? "pointer" : "default" }}>
+      <span style={{ fontSize: 13, color: strong ? C.ink : C.ink2, fontWeight: strong ? 600 : 400 }}>{label}</span>
+      <span style={{ fontFamily: MONO, fontSize: 13, fontWeight: strong ? 600 : 400, color: tone === "red" ? C.red : tone === "green" ? C.green : C.ink }}>{value}</span>
     </div>
   );
 }
-
-function Row({ label, value, strong, tone }) {
+/* one payment line: label, amount, paid toggle with date */
+function PayLine({ label, amount, paidAt, onChange, cur, muted, hint }) {
   return (
-    <div
-      className="flex items-baseline justify-between gap-4"
-      style={{ padding: "5px 0", borderBottom: `1px solid ${C.rule}` }}
-    >
-      <span style={{ fontSize: 12.5, color: strong ? C.ink : C.ink2, fontWeight: strong ? 600 : 400 }}>
-        {label}
-      </span>
-      <span
-        style={{
-          fontFamily: MONO, fontSize: 13, fontWeight: strong ? 600 : 400,
-          color: tone === "red" ? C.red : tone === "green" ? C.green : C.ink,
-        }}
-      >
-        {value}
-      </span>
+    <div className="flex items-center justify-between gap-3" style={{ padding: "9px 0", borderBottom: `1px solid ${C.rule}`, opacity: muted ? 0.5 : 1 }}>
+      <div>
+        <div style={{ fontSize: 13.5, fontWeight: 600 }}>{label}</div>
+        {hint && <div style={{ fontSize: 11.5, color: C.ink3 }}>{hint}</div>}
+      </div>
+      <div className="flex items-center gap-3">
+        <span style={{ fontFamily: MONO, fontSize: 13 }}>{money(amount, cur)}</span>
+        {onChange && (paidAt
+          ? <span className="flex items-center gap-2"><Chip tone="green">paid {paidAt}</Chip><button onClick={() => onChange("")} style={{ background: "none", border: "none", color: C.ink3, cursor: "pointer", fontSize: 12 }}>undo</button></span>
+          : <Btn kind="good" onClick={() => onChange(today())}>Mark paid</Btn>)}
+      </div>
     </div>
   );
 }
 
 /* ------------------------------------------------------------------ intake */
-const PARSE_PROMPT = `You are reading a signed accessibility services contract for AccessibilityChecker.org.
-Extract the commercial terms. Respond with ONLY a JSON object, no preamble, no markdown fences:
-{
- "client": "legal name of the client",
- "contractDate": "YYYY-MM-DD or empty string",
- "services": {"remediation": bool, "audit": bool, "vpat": bool, "pdf": bool, "monitoring": bool},
- "projectFee": number (total one-time fee, 0 if none),
- "depositPct": number (percent due upfront, usually 50),
- "monitoringMonthly": number (0 if no monitoring),
- "monitoringMonths": number (contracted term in months, 12 if unstated),
- "scopeNotes": "one short line: page/template count, platform, anything unusual",
- "confidence": "high" | "medium" | "low",
- "flags": ["anything ambiguous a human should check"]
-}
-Rules: remediation, audit, vpat and pdf are one-time work; "pdf" means remediating PDF documents for accessibility. Monitoring is the only recurring service and it starts only after the one-time work is handed over. "audit" is true when a standalone manual audit is sold. When remediation is sold, an audit is normally part of it, so set remediation true and audit false unless the audit is priced separately. Numbers must be plain numbers with no currency symbols.`;
-
-const NOTE_PROMPT = `You are reading an internal note from AccessibilityChecker.org describing work that was sold to a client. There may be no formal contract, so do not expect signatures, payment clauses or legal terms, and never flag their absence.
-Pull out whatever commercial detail is there and leave the rest empty. Respond with ONLY a JSON object, no preamble, no markdown fences:
-{
- "client": "client name if named, else empty string",
- "contractDate": "YYYY-MM-DD or empty string",
- "services": {"remediation": bool, "audit": bool, "vpat": bool, "pdf": bool, "monitoring": bool},
- "projectFee": number (0 if not stated),
- "depositPct": number (50 unless stated otherwise),
- "monitoringMonthly": number (0 if none),
- "monitoringMonths": number (12 if unstated),
- "scopeNotes": "one short line: page or template count, platform, anything unusual",
- "confidence": "high" | "medium" | "low",
- "flags": ["only things that change what we charge or what we owe someone, max 2, empty array if none"]
-}
-Shorthand is normal here: "7 tops" or "7tops" means 7 templates, "wcag aa" is the standard target. Interpret it, do not complain about it.`;
-
 function Intake({ settings, onCreate }) {
-  const [mode, setMode] = useState("contract"); // contract | note
-  const PROMPT = mode === "contract" ? PARSE_PROMPT : NOTE_PROMPT;
-  const [stage, setStage] = useState("idle"); // idle | parsing | review
+  const [mode, setMode] = useState("contract");
+  const [stage, setStage] = useState("idle");
   const [err, setErr] = useState("");
   const [pasted, setPasted] = useState("");
   const [draft, setDraft] = useState(null);
-  const [meta, setMeta] = useState(null);
   const fileRef = useRef(null);
 
-  async function parseOnServer(file, text) {
-    const fd = new FormData();
-    fd.append("mode", mode);
-    if (file) fd.append("file", file);
-    if (text) fd.append("text", text);
-    const res = await fetch("/api/parse", { method: "POST", body: fd });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || "Parsing failed");
-    return data;
-  }
-
-  function applyParsed(parsed) {
-    setDraft(
-      newProject({
-        client: parsed.client || "",
-        contractDate: parsed.contractDate || today(),
-        services: { remediation: false, audit: false, vpat: false, pdf: false, monitoring: false, ...(parsed.services || {}) },
-        projectFee: num(parsed.projectFee),
-        depositPct: num(parsed.depositPct) || 50,
-        monitoringMonthly: num(parsed.monitoringMonthly),
-        monitoringMonths: num(parsed.monitoringMonths) || 12,
-        notes: parsed.scopeNotes || "",
-      })
-    );
-    setMeta({ confidence: parsed.confidence, flags: parsed.flags || [] });
-    setStage("review");
-  }
-
-  async function handleFile(file) {
-    if (!file) return;
-    setErr("");
-    setStage("parsing");
+  async function parse(file, text) {
+    setErr(""); setStage("parsing");
     try {
-      applyParsed(await parseOnServer(file, null));
-    } catch (e) {
-      setErr(e.message);
-      setStage("idle");
-    }
-  }
-
-  async function handlePaste() {
-    if (!pasted.trim()) return;
-    setErr("");
-    setStage("parsing");
-    try {
-      applyParsed(await parseOnServer(null, pasted));
-    } catch (e) {
-      setErr(e.message);
-      setStage("idle");
-    }
+      const fd = new FormData();
+      fd.append("mode", mode);
+      if (file) fd.append("file", file);
+      if (text) fd.append("text", text);
+      const res = await fetch("/api/parse", { method: "POST", body: fd });
+      const r = await res.json();
+      if (!res.ok) throw new Error(r.error || "Could not read it");
+      setDraft(newProject({
+        client: r.client || "", contractDate: r.contractDate || today(),
+        services: { remediation: false, audit: false, vpat: false, pdf: false, monitoring: false, ...(r.services || {}) },
+        projectFee: num(r.projectFee), depositPct: num(r.depositPct) || 50, monitoringMonthly: num(r.monitoringMonthly), notes: r.scopeNotes || "",
+      }));
+      setStage("review");
+    } catch (e) { setErr(e.message); setStage("idle"); }
   }
 
   if (stage === "review" && draft) {
     const set = (patch) => setDraft({ ...draft, ...patch });
+    const ritvik = settings.team.find((t) => t.id === "ritvik");
+    const cas = settings.team.find((t) => t.id === "cas");
     return (
-      <div className="grid gap-4" style={{ maxWidth: 780 }}>
-        <Panel
-          title="What the contract says"
-          right={<Chip tone={meta?.confidence === "high" ? "green" : "amber"}>{meta?.confidence || "?"} confidence</Chip>}
-        >
+      <div className="grid gap-4" style={{ maxWidth: 720 }}>
+        <Panel title="What was sold">
           <div className="grid gap-3" style={{ gridTemplateColumns: "1fr 1fr" }}>
-            <Field label="Client">
-              <TextIn value={draft.client} onChange={(e) => set({ client: e.target.value })} />
-            </Field>
-            <Field label="Contract date">
-              <TextIn type="date" value={draft.contractDate} onChange={(e) => set({ contractDate: e.target.value })} />
-            </Field>
+            <Field label="Client"><TextIn value={draft.client} onChange={(e) => set({ client: e.target.value })} /></Field>
+            <Field label="Contract date"><TextIn type="date" value={draft.contractDate} onChange={(e) => set({ contractDate: e.target.value })} /></Field>
           </div>
-
           <div className="flex flex-wrap gap-2 mt-4">
             {Object.keys(SERVICE_LABELS).map((k) => (
-              <button
-                key={k}
-                onClick={() => set({ services: { ...draft.services, [k]: !draft.services[k] } })}
-                style={{
-                  fontFamily: SANS, fontSize: 12.5, padding: "6px 11px", borderRadius: 3, cursor: "pointer",
-                  background: draft.services[k] ? C.ink : C.panel,
-                  color: draft.services[k] ? "#fff" : C.ink2,
-                  border: `1px solid ${draft.services[k] ? C.ink : C.rule}`,
-                }}
-              >
+              <button key={k} onClick={() => set({ services: { ...draft.services, [k]: !draft.services[k] } })}
+                style={{ fontFamily: SANS, fontSize: 12.5, padding: "6px 11px", borderRadius: 3, cursor: "pointer", background: draft.services[k] ? C.ink : C.panel, color: draft.services[k] ? "#fff" : C.ink2, border: `1px solid ${draft.services[k] ? C.ink : C.rule}` }}>
                 {SERVICE_LABELS[k]}
               </button>
             ))}
           </div>
-
           <div className="grid gap-3 mt-4" style={{ gridTemplateColumns: "1fr 1fr 1fr" }}>
-            <Field label="One-time fee">
-              <NumIn value={draft.projectFee} onChange={(e) => set({ projectFee: e.target.value })} />
-            </Field>
-            <Field label="Upfront %">
-              <NumIn value={draft.depositPct} onChange={(e) => set({ depositPct: e.target.value })} />
-            </Field>
-            <Field label="Monitoring / mo">
-              <NumIn value={draft.monitoringMonthly} onChange={(e) => set({ monitoringMonthly: e.target.value })} />
-            </Field>
+            <Field label="One-time fee"><NumIn value={draft.projectFee} onChange={(e) => set({ projectFee: e.target.value })} /></Field>
+            <Field label="Upfront %"><NumIn value={draft.depositPct} onChange={(e) => set({ depositPct: e.target.value })} /></Field>
+            <Field label="Monitoring / mo"><NumIn value={draft.monitoringMonthly} onChange={(e) => set({ monitoringMonthly: e.target.value })} /></Field>
           </div>
-
-          {meta?.flags?.length > 0 && (
-            <ul className="mt-4" style={{ fontSize: 12, color: C.amber, background: C.amberSoft, padding: "9px 12px", borderRadius: 3 }}>
-              {meta.flags.map((f, i) => (
-                <li key={i}>Check: {f}</li>
-              ))}
-            </ul>
-          )}
-        </Panel>
-
-        <Panel title="Two questions before this becomes a project">
-          <p style={{ fontSize: 13, color: C.ink2, marginBottom: 12 }}>
-            How did we get this lead, and does anyone get paid for it?
-          </p>
-          <div className="grid gap-3" style={{ gridTemplateColumns: "1fr 1fr" }}>
-            <Field label="Lead source" hint="Nolan Klein, organic, partner, inbound, outbound">
-              <TextIn
-                value={draft.lead.source}
-                placeholder="e.g. Nolan Klein referral"
-                onChange={(e) => set({ lead: { ...draft.lead, source: e.target.value } })}
-              />
-            </Field>
-            <Field label="Fee owed to" hint="Leave empty if nobody gets paid">
-              <TextIn
-                value={draft.lead.partner}
-                placeholder="e.g. Nolan Klein"
-                onChange={(e) => set({ lead: { ...draft.lead, partner: e.target.value } })}
-              />
-            </Field>
-            <Field label="Fee type">
-              <select
-                value={draft.lead.feeType}
-                onChange={(e) => set({ lead: { ...draft.lead, feeType: e.target.value } })}
-                style={inputStyle}
-              >
-                <option value="pct">Percent of fee</option>
-                <option value="fixed">Fixed amount</option>
-              </select>
-            </Field>
-            <Field label={draft.lead.feeType === "pct" ? "Percent" : "Amount"}>
-              <NumIn
-                value={draft.lead.feeValue}
-                onChange={(e) => set({ lead: { ...draft.lead, feeValue: e.target.value } })}
-              />
-            </Field>
+          <div className="grid gap-3 mt-4" style={{ gridTemplateColumns: "1fr 1fr" }}>
+            <Field label="Lead source"><TextIn value={draft.lead.source} placeholder="Nolan Klein, inbound, partner" onChange={(e) => set({ lead: { ...draft.lead, source: e.target.value } })} /></Field>
+            <Field label="Referral fee owed to"><TextIn value={draft.lead.partner} placeholder="leave empty if nobody" onChange={(e) => set({ lead: { ...draft.lead, partner: e.target.value } })} /></Field>
           </div>
         </Panel>
-
+        <Panel title="What happens when you save">
+          <ul style={{ fontSize: 13, color: C.ink2, lineHeight: 1.7 }}>
+            <li>{ritvik?.email ? `Email to ${ritvik.name} (cc ${cas?.name || "Cas"}) asking for the audit${draft.services.vpat ? " and VPAT" : ""} cost.` : "No email to Ritvik: his address is not set (gear icon)."}</li>
+            <li>{cas?.email ? `Email to ${cas.name} asking for Denis hours, her hours${draft.services.pdf ? ", PDF cost" : ""}.` : "No email to Cas: her address is not set (gear icon)."}</li>
+            <li>Replies are read every Monday and the numbers go into the P&L.</li>
+          </ul>
+        </Panel>
         <div className="flex gap-2">
-          <Btn kind="primary" onClick={() => { onCreate(draft); setStage("idle"); setDraft(null); setPasted(""); }}>
-            Open the project
-          </Btn>
+          <Btn kind="primary" onClick={() => onCreate(draft)}>Save and send</Btn>
           <Btn onClick={() => { setStage("idle"); setDraft(null); }}>Discard</Btn>
         </div>
       </div>
@@ -691,77 +411,26 @@ function Intake({ settings, onCreate }) {
   return (
     <div className="grid gap-4" style={{ maxWidth: 640 }}>
       <div className="flex gap-1" style={{ background: C.panel, border: `1px solid ${C.rule}`, borderRadius: 4, padding: 4 }}>
-        {[["contract", "Signed contract"], ["note", "No contract, just describe it"]].map(([k, label]) => (
-          <button
-            key={k}
-            onClick={() => setMode(k)}
-            style={{
-              flex: 1, fontFamily: SANS, fontSize: 12.5, padding: "7px 10px", borderRadius: 3,
-              cursor: "pointer", border: "none",
-              background: mode === k ? C.ink : "transparent",
-              color: mode === k ? "#fff" : C.ink2,
-              fontWeight: mode === k ? 600 : 400,
-            }}
-          >
-            {label}
-          </button>
+        {[["contract", "Signed contract"], ["note", "No contract, just describe it"]].map(([k, l]) => (
+          <button key={k} onClick={() => setMode(k)} style={{ flex: 1, fontFamily: SANS, fontSize: 12.5, padding: "7px 10px", borderRadius: 3, cursor: "pointer", border: "none", background: mode === k ? C.ink : "transparent", color: mode === k ? "#fff" : C.ink2, fontWeight: mode === k ? 600 : 400 }}>{l}</button>
         ))}
       </div>
-
-      <Panel title={mode === "contract" ? "Signed contract" : "Scope document or notes"}>
-        <div
-          onDragOver={(e) => e.preventDefault()}
-          onDrop={(e) => { e.preventDefault(); handleFile(e.dataTransfer.files[0]); }}
-          style={{
-            border: `1px dashed ${C.rule}`, borderRadius: 4, padding: "34px 20px",
-            textAlign: "center", background: C.bg,
-          }}
-        >
-          {stage === "parsing" ? (
-            <p style={{ fontFamily: MONO, fontSize: 12, color: C.ink2 }}>Reading the contract...</p>
-          ) : (
+      <Panel title={mode === "contract" ? "Signed contract" : "Scope or notes"}>
+        <div onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); parse(e.dataTransfer.files[0], null); }}
+          style={{ border: `1px dashed ${C.rule}`, borderRadius: 4, padding: "30px 20px", textAlign: "center", background: C.bg }}>
+          {stage === "parsing" ? <p style={{ fontFamily: MONO, fontSize: 12, color: C.ink2 }}>Reading...</p> : (
             <>
-              <p style={{ fontSize: 13.5, color: C.ink, marginBottom: 4 }}>
-                {mode === "contract" ? "Drop the signed PDF here" : "Drop the scope or proposal here"}
-              </p>
-              <p style={{ fontSize: 12, color: C.ink3, marginBottom: 12 }}>
-                PDF, DOCX, image or plain text
-              </p>
-              <input
-                ref={fileRef}
-                type="file"
-                accept=".pdf,.docx,.txt,.md,image/*"
-                onChange={(e) => handleFile(e.target.files[0])}
-                style={{ display: "none" }}
-              />
+              <p style={{ fontSize: 13.5, marginBottom: 10 }}>Drop the PDF here</p>
+              <input ref={fileRef} type="file" accept=".pdf,.docx,.txt,.md,image/*" onChange={(e) => parse(e.target.files[0], null)} style={{ display: "none" }} />
               <Btn kind="primary" onClick={() => fileRef.current?.click()}>Choose a file</Btn>
             </>
           )}
         </div>
         {err && <p style={{ fontSize: 12, color: C.red, marginTop: 10 }}>{err}</p>}
-      </Panel>
-
-      <Panel title={mode === "contract" ? "Or paste the terms" : "Or type what we sold"}>
-        <textarea
-          rows={5}
-          value={pasted}
-          onChange={(e) => setPasted(e.target.value)}
-          placeholder={
-            mode === "contract"
-              ? "Paste the service order or the scope and pricing section"
-              : "e.g. Manual audit for Acme, 7 templates, WCAG 2.2 AA, $3,500, 50/50, no monitoring"
-          }
-          style={{ ...inputStyle, resize: "vertical" }}
-        />
-        <div className="mt-2">
-          <Btn onClick={handlePaste} disabled={stage === "parsing"}>Read this</Btn>
-        </div>
-      </Panel>
-
-      <Panel title="Nothing signed yet">
-        <div className="flex items-center justify-between gap-4">
-          <p style={{ fontSize: 12.5, color: C.ink2 }}>Set the project up by hand and fill the numbers in later.</p>
-          <Btn onClick={() => { setDraft(newProject()); setMeta(null); setStage("review"); }}>Blank project</Btn>
+        <textarea rows={3} value={pasted} onChange={(e) => setPasted(e.target.value)} placeholder="or type it: Manual audit for Acme, 7 templates, $3,500, 50/50, no monitoring" style={{ ...inputStyle, resize: "vertical", marginTop: 12 }} />
+        <div className="flex gap-2 mt-2">
+          <Btn onClick={() => pasted.trim() && parse(null, pasted)} disabled={stage === "parsing"}>Read this</Btn>
+          <Btn onClick={() => { setDraft(newProject()); setStage("review"); }}>Blank project</Btn>
         </div>
       </Panel>
     </div>
@@ -773,656 +442,248 @@ function Detail({ p, settings, onChange, onDelete, onBack }) {
   const n = pnl(p, settings);
   const cur = settings.currency;
   const set = (patch) => onChange({ ...p, ...patch });
-  const [entry, setEntry] = useState({ date: today(), hours: "", note: "" });
-  const [mEntry, setMEntry] = useState({ month: thisMonth(), hours: "", note: "" });
-  const [lookup, setLookup] = useState("");
-  const devName = (settings.team.find((t) => t.id === "dev") || {}).name || "Developer";
+  const setCost = (k, patch) => set({ costs: { ...p.costs, [k]: { ...p.costs[k], ...patch } } });
+  const [open, setOpen] = useState(null);
+  const [msg, setMsg] = useState("");
+  const [preview, setPreview] = useState(null);
 
-  async function findInvoices() {
-    setLookup("Searching Gmail...");
-    try {
-      const r = await api(`/api/projects/${p.id}/find-invoices`, { method: "POST" });
-      set({
-        deposit: { ...p.deposit, ...Object.fromEntries(Object.entries(r.deposit || {}).filter(([, v]) => v)) },
-        balance: { ...p.balance, ...Object.fromEntries(Object.entries(r.balance || {}).filter(([, v]) => v)) },
-      });
-      setLookup(r.note || "Updated from Gmail.");
-    } catch (e) {
-      setLookup(`Gmail: ${e.message}`);
-    }
+  async function ingest() {
+    setMsg("Reading replies...");
+    try { const u = await api(`/api/projects/${p.id}/ingest`, { method: "POST" }); onChange(u); setMsg(u.lastReplyNote || "No replies yet."); }
+    catch (e) { setMsg(e.message); }
   }
+  async function resend(kind) {
+    setMsg(`Sending to ${kind}...`);
+    try { const u = await api(`/api/projects/${p.id}/request/${kind}`, { method: "POST" }); onChange(u); setMsg(u.requests?.[kind]?.error || `Sent ${u.requests?.[kind]?.sentAt}`); }
+    catch (e) { setMsg(e.message); }
+  }
+  async function showPreview(kind) {
+    try { setPreview(await api(`/api/projects/${p.id}/preview/${kind}`)); } catch (e) { setMsg(e.message); }
+  }
+
+  const costLine = (key, label, amountValue, editor) => (
+    <div key={key}>
+      <Row label={label} value={"-" + money(amountValue, cur)} onClick={() => setOpen(open === key ? null : key)} />
+      {open === key && <div className="grid gap-3 mt-2 mb-3" style={{ gridTemplateColumns: "1fr 1fr 1fr", padding: "10px 12px", background: C.bg, borderRadius: 3 }}>{editor}</div>}
+    </div>
+  );
+  const paidField = (k) => <Field label="Paid out on"><TextIn type="date" value={p.costs[k].paidAt} onChange={(e) => setCost(k, { paidAt: e.target.value })} /></Field>;
+  const noteField = (k) => <Field label="Note"><TextIn value={p.costs[k].note} onChange={(e) => setCost(k, { note: e.target.value })} /></Field>;
+  const sold = (k) => p.services[k];
 
   return (
     <div className="grid gap-4">
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div className="flex items-center gap-3">
-          <Btn onClick={onBack}>&larr; All projects</Btn>
-          <input
-            value={p.client}
-            onChange={(e) => set({ client: e.target.value })}
-            placeholder="Client name"
-            style={{ ...inputStyle, fontSize: 19, fontWeight: 600, border: "1px solid transparent", background: "transparent", width: 300 }}
-          />
+          <Btn onClick={onBack}>&larr; Projects</Btn>
+          <input value={p.client} onChange={(e) => set({ client: e.target.value })} placeholder="Client" style={{ ...inputStyle, fontSize: 19, fontWeight: 600, border: "1px solid transparent", background: "transparent", width: 320 }} />
+          <Chip tone={paymentState(p) === "paid" ? "green" : "amber"}>{STATE_LABEL[paymentState(p)]}</Chip>
         </div>
         <div className="flex items-center gap-2">
-          <select
-            value={p.status}
-            onChange={(e) => {
-              const status = e.target.value;
-              const patch = { status };
-              if (status === "delivered" && !p.deliveredAt) patch.deliveredAt = today();
-              set(patch);
-            }}
-            style={{ ...inputStyle, width: "auto" }}
-          >
-            <option value="draft">Draft</option>
-            <option value="active">In remediation</option>
-            <option value="delivered">Delivered</option>
-            <option value="closed">Closed</option>
-          </select>
+          <label className="flex items-center gap-2" style={{ fontSize: 12.5, color: C.ink2 }}>
+            <input type="checkbox" checked={p.closed} onChange={(e) => set({ closed: e.target.checked })} /> Closed
+          </label>
           <Btn kind="danger" onClick={onDelete}>Delete</Btn>
         </div>
       </div>
 
-      <div className="grid gap-4" style={{ gridTemplateColumns: "minmax(0,1.15fr) minmax(0,1fr)" }}>
-        <div className="grid gap-4">
-          <Panel title="One-time P&L" right={<Chip tone="slate">{ONE_TIME.filter((k) => p.services[k]).map((k) => SHORT[k]).join(" + ") || "nothing sold"}</Chip>}>
-            <MarginRibbon n={n} cur={cur} />
+      <div className="grid gap-4" style={{ gridTemplateColumns: "minmax(0,1fr) minmax(0,1fr)" }}>
+        <Panel title="P&L" right={<span style={{ fontSize: 11, color: C.ink3 }}>click a line to edit</span>}>
+          <Row label="Contract value" value={money(n.fee, cur)} strong />
+          {(sold("audit") || sold("remediation")) && costLine("audit", "Manual audit, Ritvik", n.audit, <>
+            <Field label="Cost"><NumIn value={p.costs.audit.amount} onChange={(e) => setCost("audit", { amount: e.target.value })} /></Field>{paidField("audit")}{noteField("audit")}
+          </>)}
+          {sold("vpat") && costLine("vpat", "VPAT, Ritvik", n.vpat, <>
+            <Field label="Cost"><NumIn value={p.costs.vpat.amount} onChange={(e) => setCost("vpat", { amount: e.target.value })} /></Field>{paidField("vpat")}{noteField("vpat")}
+          </>)}
+          {sold("remediation") && costLine("dev", `Development, Denis (${num(p.costs.dev.hours)}h)`, n.dev, <>
+            <Field label="Hours"><NumIn value={p.costs.dev.hours} onChange={(e) => setCost("dev", { hours: e.target.value })} /></Field>{paidField("dev")}{noteField("dev")}
+          </>)}
+          {sold("pdf") && costLine("pdf", "PDF remediation", n.pdf, <>
+            <Field label="Cost"><NumIn value={p.costs.pdf.amount} onChange={(e) => setCost("pdf", { amount: e.target.value })} /></Field>{paidField("pdf")}{noteField("pdf")}
+          </>)}
+          {costLine("pm", `Project management, Cas (${num(p.costs.pm.hours)}h)`, n.pm, <>
+            <Field label="Hours"><NumIn value={p.costs.pm.hours} onChange={(e) => setCost("pm", { hours: e.target.value })} /></Field>{paidField("pm")}{noteField("pm")}
+          </>)}
+          {(p.lead.partner || n.referral > 0) && costLine("referral", `Referral, ${p.lead.partner || "partner"}`, n.referral, <>
+            <Field label="Amount"><NumIn value={p.costs.referral.amount} onChange={(e) => setCost("referral", { amount: e.target.value })} /></Field>{paidField("referral")}{noteField("referral")}
+          </>)}
+          {costLine("sales", "Sales fee, Gabriel", n.sales, <>
+            <Field label="Amount"><NumIn value={p.costs.sales.amount} onChange={(e) => setCost("sales", { amount: e.target.value })} /></Field>{paidField("sales")}{noteField("sales")}
+          </>)}
+          <Row label="Margin" value={`${money(n.margin, cur)}   ${n.marginPct.toFixed(0)}%`} strong tone={n.margin < 0 ? "red" : "green"} />
+
+          {p.services.monitoring && (
             <div className="mt-4">
-              <Row label="Contract value" value={money(n.fee, cur)} strong />
-              <Row label={`Referral${p.lead.partner ? ` to ${p.lead.partner}` : ""}`} value={"-" + money(n.referral, cur)} />
-              {p.services.audit && <Row label="Manual audit, Ritvik (fixed)" value={"-" + money(n.audit, cur)} />}
-              {p.services.vpat && <Row label="VPAT, Ritvik (fixed)" value={"-" + money(n.vpat, cur)} />}
-              {p.services.pdf && <Row label="PDF remediation (fixed)" value={"-" + money(n.pdf, cur)} />}
-              <Row label={`Developer time (${n.dh}h @ ${money(n.dr, cur)})`} value={"-" + money(n.dev, cur)} />
-              <Row label={`Project management (${settings.pmPct}%)`} value={"-" + money(n.pm, cur)} />
-              <Row label={`Sales (${settings.salesPct}%)`} value={"-" + money(n.sales, cur)} />
-              <Row label="Total cost" value={"-" + money(n.cost, cur)} />
-              <Row
-                label="Margin"
-                value={`${money(n.margin, cur)}   ${n.marginPct.toFixed(0)}%`}
-                strong
-                tone={n.margin < 0 ? "red" : "green"}
-              />
+              <div style={{ fontFamily: MONO, fontSize: 10, letterSpacing: ".08em", textTransform: "uppercase", color: C.ink3, marginBottom: 4 }}>Monitoring, {n.state === "running" ? "running" : "starts at handover"}</div>
+              <Row label={`${n.mMonths} months billed at ${money(n.mFee, cur)}`} value={money(n.mRevenue, cur)} />
+              <Row label="Dev hours on fixes" value={"-" + money(n.mCost, cur)} />
+              <Row label="Monitoring margin" value={money(n.mMargin, cur)} strong tone={n.mMargin < 0 ? "red" : "green"} />
+            </div>
+          )}
+        </Panel>
+
+        <div className="grid gap-4" style={{ alignContent: "start" }}>
+          <Panel title="Payments">
+            <PayLine label={`Deposit ${p.depositPct}%`} amount={n.deposit} paidAt={p.deposit.paidAt} cur={cur} onChange={(d) => set({ deposit: { ...p.deposit, paidAt: d } })} />
+            <PayLine label="Balance on completion" amount={n.balance} paidAt={p.balance.paidAt} cur={cur} onChange={(d) => set({ balance: { ...p.balance, paidAt: d } })}
+              hint={!p.deliveredAt ? "not handed over yet" : p.balance.invoicedAt ? `invoiced ${p.balance.invoicedAt}` : "handed over, invoice it"} />
+            {p.services.monitoring
+              ? <PayLine label="Monitoring" amount={n.mFee} cur={cur} hint={n.state === "running" ? `running since ${p.deliveredAt}, ${n.mMonths} months logged` : "starts when remediation is handed over"} />
+              : <PayLine label="Monitoring" amount={0} cur={cur} muted hint={p.upsellCall.bookedAt ? `call booked ${p.upsellCall.bookedAt}` : "not sold, book the call after handover"} />}
+            <div className="grid gap-3 mt-3" style={{ gridTemplateColumns: "1fr 1fr" }}>
+              <Field label="Handed over"><TextIn type="date" value={p.deliveredAt} onChange={(e) => set({ deliveredAt: e.target.value })} /></Field>
+              <Field label="Balance invoiced"><TextIn type="date" value={p.balance.invoicedAt} onChange={(e) => set({ balance: { ...p.balance, invoicedAt: e.target.value } })} /></Field>
             </div>
           </Panel>
 
-          <Panel title="What the one-time work costs us">
-            <div className="grid gap-3" style={{ gridTemplateColumns: "1fr 1fr 1fr 1fr" }}>
-              <Field label="Audit cost" hint="Ritvik quotes">
-                <NumIn value={p.auditCost} onChange={(e) => set({ auditCost: e.target.value })} />
-              </Field>
-              <Field label="VPAT cost" hint="Ritvik quotes">
-                <NumIn value={p.vpatCost} onChange={(e) => set({ vpatCost: e.target.value })} />
-              </Field>
-              <Field label="PDF cost" hint="per project">
-                <NumIn value={p.pdfCost} onChange={(e) => set({ pdfCost: e.target.value })} />
-              </Field>
-              <Field label="Dev rate / hour" hint={`Default ${money(settings.rateDev, cur)}`}>
-                <NumIn
-                  value={p.devRateOverride === null ? settings.rateDev : p.devRateOverride}
-                  onChange={(e) => set({ devRateOverride: e.target.value })}
-                />
-              </Field>
-            </div>
-
-            <div className="flex items-center justify-between mt-5 mb-2">
-              <span style={{ fontFamily: MONO, fontSize: 10, letterSpacing: ".08em", textTransform: "uppercase", color: C.ink3 }}>
-                Developer hours, remediation phase
-              </span>
-              <span style={{ fontFamily: MONO, fontSize: 13 }}>{n.dh}h &middot; {money(n.dev, cur)}</span>
-            </div>
-            {(p.devLog || []).length > 0 && (
-              <div style={{ borderTop: `1px solid ${C.rule}` }}>
-                {p.devLog.map((e, i) => (
-                  <div key={i} className="flex items-center justify-between gap-3" style={{ padding: "6px 0", borderBottom: `1px solid ${C.rule}` }}>
-                    <span style={{ fontFamily: MONO, fontSize: 11.5, color: C.ink3, width: 88 }}>{e.date}</span>
-                    <span style={{ fontSize: 12.5, color: C.ink2, flex: 1 }}>{e.who || "Developer"}{e.note ? `, ${e.note}` : ""}</span>
-                    <span style={{ fontFamily: MONO, fontSize: 12.5 }}>{num(e.hours)}h</span>
-                    <button
-                      onClick={() => set({ devLog: p.devLog.filter((_, j) => j !== i) })}
-                      style={{ background: "none", border: "none", cursor: "pointer", color: C.ink3, fontSize: 14 }}
-                      aria-label="Remove entry"
-                    >
-                      &times;
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-            <div className="flex gap-2 items-end mt-3">
-              <Field label="Week of">
-                <TextIn type="date" value={entry.date} onChange={(e) => setEntry({ ...entry, date: e.target.value })} />
-              </Field>
-              <Field label="Hours">
-                <NumIn value={entry.hours} onChange={(e) => setEntry({ ...entry, hours: e.target.value })} style={{ width: 80 }} />
-              </Field>
-              <Field label="Note">
-                <TextIn value={entry.note} placeholder="what was done" onChange={(e) => setEntry({ ...entry, note: e.target.value })} />
-              </Field>
-              <Btn
-                onClick={() => {
-                  if (!num(entry.hours)) return;
-                  set({ devLog: [...(p.devLog || []), { ...entry, who: devName }] });
-                  setEntry({ date: today(), hours: "", note: "" });
-                }}
-              >
-                Log
-              </Btn>
-            </div>
-          </Panel>
-
-          {p.services.monitoring ? (
-            <Panel
-              title="Ongoing P&L, monitoring"
-              right={
-                <Chip tone={n.state === "running" ? "green" : "amber"}>
-                  {n.state === "running" ? "running" : "not started"}
-                </Chip>
-              }
-            >
-              {n.state === "pending" && (
-                <p style={{ fontSize: 12.5, color: C.amber, background: C.amberSoft, padding: "9px 12px", borderRadius: 3, marginBottom: 12 }}>
-                  {p.deliveredAt
-                    ? `Signed, starting ${p.monitoringStartsAt || p.deliveredAt}.`
-                    : "Signed, but remediation is not handed over yet, so it is out of MRR and out of the monthly P&L."}
-                </p>
-              )}
-              <div className="grid gap-3" style={{ gridTemplateColumns: "1fr 1fr 1fr" }}>
-                <Field label="Per month">
-                  <NumIn value={p.monitoringMonthly} onChange={(e) => set({ monitoringMonthly: e.target.value })} />
-                </Field>
-                <Field label="Term, months">
-                  <NumIn value={p.monitoringMonths} onChange={(e) => set({ monitoringMonths: e.target.value })} />
-                </Field>
-                <Field label="Starts" hint="defaults to handover">
-                  <TextIn
-                    type="date"
-                    value={p.monitoringStartsAt || p.deliveredAt}
-                    onChange={(e) => set({ monitoringStartsAt: e.target.value })}
-                  />
-                </Field>
-              </div>
-
-              <div className="flex items-center justify-between mt-5 mb-2">
-                <span style={{ fontFamily: MONO, fontSize: 10, letterSpacing: ".08em", textTransform: "uppercase", color: C.ink3 }}>
-                  Months served
-                </span>
-                <span style={{ fontFamily: MONO, fontSize: 13 }}>{n.mMonths} of {p.monitoringMonths}</span>
-              </div>
-              {(p.monitoringLog || []).length > 0 && (
-                <div style={{ borderTop: `1px solid ${C.rule}` }}>
-                  {p.monitoringLog.map((e, i) => {
-                    const mm = n.mFee - num(e.hours) * n.dr - (n.mFee * (num(settings.pmPct) + num(settings.salesPct))) / 100;
-                    return (
-                      <div key={i} className="flex items-center justify-between gap-3" style={{ padding: "6px 0", borderBottom: `1px solid ${C.rule}` }}>
-                        <span style={{ fontFamily: MONO, fontSize: 11.5, color: C.ink3, width: 78 }}>{monthName(e.month)}</span>
-                        <span style={{ fontSize: 12.5, color: C.ink2, flex: 1 }}>{num(e.hours)}h of fixes{e.note ? `, ${e.note}` : ""}</span>
-                        <span style={{ fontFamily: MONO, fontSize: 12.5, color: mm < 0 ? C.red : C.green }}>{money(mm, cur)}</span>
-                        <button
-                          onClick={() =>
-                            set({
-                              monitoringLog: p.monitoringLog.map((x, j) =>
-                                j === i ? { ...x, paidAt: x.paidAt ? "" : today() } : x
-                              ),
-                            })
-                          }
-                          style={{ background: "none", border: "none", cursor: "pointer", fontSize: 11, fontFamily: MONO, color: e.paidAt ? C.green : C.ink3 }}
-                        >
-                          {e.paidAt ? "paid" : "unpaid"}
-                        </button>
-                        <button
-                          onClick={() => set({ monitoringLog: p.monitoringLog.filter((_, j) => j !== i) })}
-                          style={{ background: "none", border: "none", cursor: "pointer", color: C.ink3, fontSize: 14 }}
-                          aria-label="Remove month"
-                        >
-                          &times;
-                        </button>
-                      </div>
-                    );
-                  })}
+          <Panel title="Where the numbers come from" right={<Btn onClick={ingest}>Read replies now</Btn>}>
+            {["ritvik", "cas"].map((k) => {
+              const r = p.requests?.[k];
+              const who = settings.team.find((t) => t.id === k)?.name || k;
+              return (
+                <div key={k} className="flex items-center justify-between gap-3" style={{ padding: "7px 0", borderBottom: `1px solid ${C.rule}` }}>
+                  <span style={{ fontSize: 13 }}>{who}</span>
+                  <span className="flex items-center gap-2">
+                    {r?.sentAt ? <Chip tone="green">asked {r.sentAt}</Chip> : r?.error ? <Chip tone="red">{r.error.slice(0, 40)}</Chip> : <Chip tone="amber">not asked</Chip>}
+                    <button onClick={() => showPreview(k)} style={{ background: "none", border: "none", color: C.ink3, cursor: "pointer", fontSize: 12 }}>preview</button>
+                    <button onClick={() => resend(k)} style={{ background: "none", border: "none", color: C.ink3, cursor: "pointer", fontSize: 12 }}>send again</button>
+                  </span>
                 </div>
-              )}
-              <div className="flex gap-2 items-end mt-3">
-                <Field label="Month">
-                  <TextIn type="month" value={mEntry.month} onChange={(e) => setMEntry({ ...mEntry, month: e.target.value })} />
-                </Field>
-                <Field label="Dev hours" hint="scan then fix">
-                  <NumIn value={mEntry.hours} onChange={(e) => setMEntry({ ...mEntry, hours: e.target.value })} style={{ width: 80 }} />
-                </Field>
-                <Field label="Note">
-                  <TextIn value={mEntry.note} placeholder="what the scan found" onChange={(e) => setMEntry({ ...mEntry, note: e.target.value })} />
-                </Field>
-                <Btn
-                  disabled={n.state !== "running"}
-                  onClick={() => {
-                    if (!mEntry.month) return;
-                    set({ monitoringLog: [...(p.monitoringLog || []), { ...mEntry, paidAt: "" }] });
-                    setMEntry({ month: thisMonth(), hours: "", note: "" });
-                  }}
-                >
-                  Log month
-                </Btn>
-              </div>
+              );
+            })}
+            {msg && <p style={{ fontSize: 12, color: C.ink2, marginTop: 8 }}>{msg}</p>}
+            {preview && (
+              <pre style={{ marginTop: 10, background: C.bg, padding: 12, borderRadius: 3, fontFamily: SANS, fontSize: 12.5, color: C.ink2, whiteSpace: "pre-wrap" }}>
+                To: {preview.to || "(no address set)"}{preview.cc ? `\nCc: ${preview.cc}` : ""}{"\n"}Subject: {preview.subject}{"\n\n"}{preview.body}
+              </pre>
+            )}
+          </Panel>
 
-              <div className="mt-4">
-                <Row label={`Billed, ${n.mMonths} months`} value={money(n.mRevenue, cur)} strong />
-                <Row label={`Developer fixes (${n.mHours}h @ ${money(n.dr, cur)})`} value={"-" + money(n.mLabor, cur)} />
-                <Row label={`Overhead (${num(settings.pmPct) + num(settings.salesPct)}%)`} value={"-" + money(n.mOverhead, cur)} />
-                <Row label="Margin to date" value={`${money(n.mMargin, cur)}   ${n.mMarginPct.toFixed(0)}%`} strong tone={n.mMargin < 0 ? "red" : "green"} />
-                <Row label="Unpaid months" value={money(n.mOutstanding, cur)} tone={n.mOutstanding > 0 ? "red" : undefined} />
-                <Row label={`Contracted value, ${p.monitoringMonths} months`} value={money(n.mFee * num(p.monitoringMonths), cur)} />
-              </div>
-            </Panel>
-          ) : (
-            <Panel title="Ongoing P&L, monitoring">
-              <p style={{ fontSize: 13, color: C.ink2 }}>
-                Not sold. When this project is marked delivered, a call lands in Reminders.
-              </p>
-              <div className="grid gap-3 mt-3" style={{ gridTemplateColumns: "1fr 1fr" }}>
-                <Field label="Upsell call booked">
-                  <TextIn type="date" value={p.upsellCall.bookedAt} onChange={(e) => set({ upsellCall: { ...p.upsellCall, bookedAt: e.target.value } })} />
-                </Field>
-                <Field label="Outcome">
-                  <TextIn value={p.upsellCall.outcome} placeholder="Signed, thinking, declined" onChange={(e) => set({ upsellCall: { ...p.upsellCall, outcome: e.target.value } })} />
-                </Field>
+          {p.services.monitoring && n.state === "running" && <MonitoringLog p={p} set={set} settings={settings} />}
+          {p.deliveredAt && !p.services.monitoring && (
+            <Panel title="Monitoring upsell">
+              <div className="grid gap-3" style={{ gridTemplateColumns: "1fr 1fr" }}>
+                <Field label="Call booked"><TextIn type="date" value={p.upsellCall.bookedAt} onChange={(e) => set({ upsellCall: { ...p.upsellCall, bookedAt: e.target.value } })} /></Field>
+                <Field label="Outcome"><TextIn value={p.upsellCall.outcome} onChange={(e) => set({ upsellCall: { ...p.upsellCall, outcome: e.target.value } })} /></Field>
               </div>
             </Panel>
           )}
         </div>
-
-        <div className="grid gap-4" style={{ alignContent: "start" }}>
-          <Panel title="Payments" right={<Btn onClick={findInvoices}>Find in Gmail</Btn>}>
-            {lookup && <p style={{ fontSize: 12, color: C.ink2, marginBottom: 12 }}>{lookup}</p>}
-            {[["deposit", `Deposit ${p.depositPct}%`, n.deposit], ["balance", "Balance on completion", n.balance]].map(([key, label, amt]) => (
-              <div key={key} style={{ marginBottom: 14 }}>
-                <div className="flex items-center justify-between mb-2">
-                  <span style={{ fontSize: 13, fontWeight: 600 }}>{label}</span>
-                  <span style={{ fontFamily: MONO, fontSize: 13 }}>{money(amt, cur)}</span>
-                </div>
-                <div className="grid gap-2" style={{ gridTemplateColumns: "1fr 1fr" }}>
-                  <Field label="Invoice no.">
-                    <TextIn value={p[key].invoiceNo} onChange={(e) => set({ [key]: { ...p[key], invoiceNo: e.target.value } })} />
-                  </Field>
-                  <Field label="Invoice date">
-                    <TextIn type="date" value={p[key].invoicedAt} onChange={(e) => set({ [key]: { ...p[key], invoicedAt: e.target.value } })} />
-                  </Field>
-                  <Field label="Due" hint={p[key].dueAt ? "" : `${settings.termsDays} days from invoice`}>
-                    <TextIn type="date" value={dueDate(p[key], settings)} onChange={(e) => set({ [key]: { ...p[key], dueAt: e.target.value } })} />
-                  </Field>
-                  <Field label="Paid">
-                    <TextIn type="date" value={p[key].paidAt} onChange={(e) => set({ [key]: { ...p[key], paidAt: e.target.value } })} />
-                  </Field>
-                </div>
-              </div>
-            ))}
-            <div className="mt-4">
-              <Row label="Collected" value={money(n.collected, cur)} tone="green" />
-              <Row label="Outstanding" value={money(n.outstanding, cur)} strong tone={n.outstanding > 0 ? "red" : undefined} />
-            </div>
-          </Panel>
-
-          <Panel title="Contract">
-            <div className="grid gap-3">
-              <div className="grid gap-3" style={{ gridTemplateColumns: "1fr 1fr" }}>
-                <Field label="One-time fee">
-                  <NumIn value={p.projectFee} onChange={(e) => set({ projectFee: e.target.value })} />
-                </Field>
-                <Field label="Upfront %">
-                  <NumIn value={p.depositPct} onChange={(e) => set({ depositPct: e.target.value })} />
-                </Field>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                {Object.keys(SERVICE_LABELS).map((k) => (
-                  <button
-                    key={k}
-                    onClick={() => set({ services: { ...p.services, [k]: !p.services[k] } })}
-                    style={{
-                      fontFamily: SANS, fontSize: 12, padding: "5px 9px", borderRadius: 3, cursor: "pointer",
-                      background: p.services[k] ? C.ink : C.panel,
-                      color: p.services[k] ? "#fff" : C.ink3,
-                      border: `1px solid ${p.services[k] ? C.ink : C.rule}`,
-                    }}
-                  >
-                    {SERVICE_LABELS[k]}
-                  </button>
-                ))}
-              </div>
-              <div className="grid gap-3" style={{ gridTemplateColumns: "1fr 1fr" }}>
-                <Field label="Contract date">
-                  <TextIn type="date" value={p.contractDate} onChange={(e) => set({ contractDate: e.target.value })} />
-                </Field>
-                <Field label="Handover date" hint="starts monitoring">
-                  <TextIn type="date" value={p.deliveredAt} onChange={(e) => set({ deliveredAt: e.target.value })} />
-                </Field>
-              </div>
-              <Field label="Lead source">
-                <TextIn value={p.lead.source} onChange={(e) => set({ lead: { ...p.lead, source: e.target.value } })} />
-              </Field>
-              <div className="grid gap-3" style={{ gridTemplateColumns: "1.2fr .8fr" }}>
-                <Field label="Referral to">
-                  <TextIn value={p.lead.partner} onChange={(e) => set({ lead: { ...p.lead, partner: e.target.value } })} />
-                </Field>
-                <Field label={p.lead.feeType === "pct" ? "Percent" : "Amount"}>
-                  <NumIn value={p.lead.feeValue} onChange={(e) => set({ lead: { ...p.lead, feeValue: e.target.value } })} />
-                </Field>
-              </div>
-              <label className="flex items-center gap-2" style={{ fontSize: 12.5, color: C.ink2 }}>
-                <input type="checkbox" checked={p.lead.feePaid} onChange={(e) => set({ lead: { ...p.lead, feePaid: e.target.checked } })} />
-                Referral fee paid out
-              </label>
-              <Field label="Notes">
-                <textarea rows={3} value={p.notes} onChange={(e) => set({ notes: e.target.value })} style={{ ...inputStyle, resize: "vertical" }} />
-              </Field>
-            </div>
-          </Panel>
-        </div>
       </div>
     </div>
   );
 }
 
-/* --------------------------------------------------------------- monthly */
-function MonthlyTab({ months, settings }) {
+function MonitoringLog({ p, set, settings }) {
+  const [m, setM] = useState({ month: thisMonth(), hours: "" });
   const cur = settings.currency;
-  if (months.length === 0) {
-    return (
-      <Panel>
-        <p style={{ fontSize: 13, color: C.ink3, textAlign: "center", padding: 20 }}>
-          Nothing to report yet. A one-time project lands in the month it is handed over, monitoring lands in each month you log.
-        </p>
-      </Panel>
-    );
-  }
-  const peak = Math.max(...months.map((m) => Math.max(m.rev, 1)));
-  const sum = months.reduce(
-    (a, m) => ({ oneRev: a.oneRev + m.oneRev, oneMargin: a.oneMargin + m.oneMargin, monRev: a.monRev + m.monRev, monMargin: a.monMargin + m.monMargin }),
-    { oneRev: 0, oneMargin: 0, monRev: 0, monMargin: 0 }
+  return (
+    <Panel title="Monitoring months">
+      {(p.monitoringLog || []).map((e, i) => (
+        <div key={i} className="flex items-center justify-between gap-3" style={{ padding: "6px 0", borderBottom: `1px solid ${C.rule}` }}>
+          <span style={{ fontFamily: MONO, fontSize: 12 }}>{monthName(e.month)}</span>
+          <span style={{ fontSize: 12.5, color: C.ink2, flex: 1 }}>{num(e.hours)}h fixes</span>
+          {e.paidAt ? <Chip tone="green">paid {e.paidAt}</Chip> : <Btn kind="good" onClick={() => set({ monitoringLog: p.monitoringLog.map((x, j) => (j === i ? { ...x, paidAt: today() } : x)) })}>Mark paid</Btn>}
+          <button onClick={() => set({ monitoringLog: p.monitoringLog.filter((_, j) => j !== i) })} style={{ background: "none", border: "none", cursor: "pointer", color: C.ink3 }}>&times;</button>
+        </div>
+      ))}
+      <div className="flex gap-2 items-end mt-3">
+        <Field label="Month"><TextIn type="month" value={m.month} onChange={(e) => setM({ ...m, month: e.target.value })} /></Field>
+        <Field label="Dev hours"><NumIn value={m.hours} onChange={(e) => setM({ ...m, hours: e.target.value })} style={{ width: 90 }} /></Field>
+        <Btn onClick={() => { if (!m.month) return; set({ monitoringLog: [...(p.monitoringLog || []), { ...m, paidAt: "" }] }); setM({ month: thisMonth(), hours: "" }); }}>Log month</Btn>
+      </div>
+    </Panel>
   );
+}
 
+/* --------------------------------------------------------------- cash flow */
+function CashFlowTab({ projects, settings }) {
+  const cur = settings.currency;
+  const rows = useMemo(() => cashFlow(projects, settings), [projects, settings]);
+  const [open, setOpen] = useState(null);
+  if (rows.length === 0) return <Panel><p style={{ padding: 20, textAlign: "center", fontSize: 13, color: C.ink3 }}>Nothing yet. Money shows up here on the day it's marked paid in or paid out.</p></Panel>;
+  const peak = Math.max(...rows.map((r) => Math.max(r.in, r.out, 1)));
+  const tot = rows.reduce((a, r) => ({ in: a.in + r.in, out: a.out + r.out }), { in: 0, out: 0 });
   return (
     <div className="grid gap-4">
-      <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fit,minmax(180px,1fr))" }}>
-        {[
-          ["One-time revenue", sum.oneRev, C.slate],
-          ["One-time margin", sum.oneMargin, sum.oneMargin < 0 ? C.red : C.green],
-          ["Monitoring revenue", sum.monRev, C.slate],
-          ["Monitoring margin", sum.monMargin, sum.monMargin < 0 ? C.red : C.green],
-        ].map(([l, v, c]) => (
+      <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(3,1fr)" }}>
+        {[["Cash in", tot.in, C.green], ["Cash out", tot.out, C.red], ["Net", tot.in - tot.out, tot.in - tot.out < 0 ? C.red : C.green]].map(([l, v, c]) => (
           <div key={l} style={{ background: C.panel, border: `1px solid ${C.rule}`, borderRadius: 4, padding: "11px 13px" }}>
             <div style={{ fontFamily: MONO, fontSize: 9.5, letterSpacing: ".1em", textTransform: "uppercase", color: C.ink3 }}>{l}</div>
-            <div style={{ fontFamily: MONO, fontSize: 18, marginTop: 5, color: c }}>{money(v, cur)}</div>
+            <div style={{ fontFamily: MONO, fontSize: 19, marginTop: 5, color: c }}>{money(v, cur)}</div>
           </div>
         ))}
       </div>
-
       <Panel title="Month by month" pad={false}>
-        <table style={{ width: "100%", borderCollapse: "collapse" }}>
-          <thead>
-            <tr style={{ fontFamily: MONO, fontSize: 9.5, letterSpacing: ".08em", textTransform: "uppercase", color: C.ink3 }}>
-              <th style={{ textAlign: "left", padding: "8px 14px", borderBottom: `1px solid ${C.rule}`, fontWeight: 400 }}>Month</th>
-              <th style={{ textAlign: "left", padding: "8px 14px", borderBottom: `1px solid ${C.rule}`, fontWeight: 400, width: "26%" }}>Mix</th>
-              {["One-time rev", "One-time margin", "Monitoring rev", "Monitoring margin", "Total margin"].map((h) => (
-                <th key={h} style={{ textAlign: "right", padding: "8px 14px", borderBottom: `1px solid ${C.rule}`, fontWeight: 400 }}>{h}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {months.map((m) => (
-              <tr key={m.month} style={{ borderBottom: `1px solid ${C.rule}` }}>
-                <td style={{ padding: "10px 14px", fontSize: 13.5, fontWeight: 500 }}>{monthName(m.month)}</td>
-                <td style={{ padding: "10px 14px" }}>
-                  <div className="flex" style={{ height: 14, width: `${(m.rev / peak) * 100}%`, minWidth: 4, borderRadius: 2, overflow: "hidden" }}>
-                    <div style={{ width: `${m.rev ? (m.oneRev / m.rev) * 100 : 0}%`, background: C.slate }} />
-                    <div style={{ width: `${m.rev ? (m.monRev / m.rev) * 100 : 0}%`, background: C.green }} />
-                  </div>
-                </td>
-                <td style={{ padding: "10px 14px", textAlign: "right", fontFamily: MONO, fontSize: 13 }}>{money(m.oneRev, cur)}</td>
-                <td style={{ padding: "10px 14px", textAlign: "right", fontFamily: MONO, fontSize: 13, color: m.oneMargin < 0 ? C.red : C.ink2 }}>{money(m.oneMargin, cur)}</td>
-                <td style={{ padding: "10px 14px", textAlign: "right", fontFamily: MONO, fontSize: 13 }}>{money(m.monRev, cur)}</td>
-                <td style={{ padding: "10px 14px", textAlign: "right", fontFamily: MONO, fontSize: 13, color: m.monMargin < 0 ? C.red : C.ink2 }}>{money(m.monMargin, cur)}</td>
-                <td style={{ padding: "10px 14px", textAlign: "right", fontFamily: MONO, fontSize: 13, fontWeight: 600, color: m.total < 0 ? C.red : C.green }}>{money(m.total, cur)}</td>
-              </tr>
+        {rows.map((r) => (
+          <div key={r.month}>
+            <div onClick={() => setOpen(open === r.month ? null : r.month)} className="grid items-center gap-4" style={{ gridTemplateColumns: "110px 1fr 110px 110px 110px", padding: "10px 14px", borderBottom: `1px solid ${C.rule}`, cursor: "pointer" }}>
+              <span style={{ fontSize: 13.5, fontWeight: 600 }}>{monthName(r.month)}</span>
+              <div className="grid gap-1">
+                <div style={{ height: 8, width: `${(r.in / peak) * 100}%`, background: C.green, borderRadius: 2 }} />
+                <div style={{ height: 8, width: `${(r.out / peak) * 100}%`, background: C.red, borderRadius: 2, opacity: 0.7 }} />
+              </div>
+              <span style={{ fontFamily: MONO, fontSize: 13, textAlign: "right", color: C.green }}>{money(r.in, cur)}</span>
+              <span style={{ fontFamily: MONO, fontSize: 13, textAlign: "right", color: C.red }}>-{money(r.out, cur)}</span>
+              <span style={{ fontFamily: MONO, fontSize: 13, textAlign: "right", fontWeight: 600, color: r.net < 0 ? C.red : C.ink }}>{money(r.net, cur)}</span>
+            </div>
+            {open === r.month && r.lines.map((l, i) => (
+              <div key={i} className="flex justify-between" style={{ padding: "5px 14px 5px 40px", fontSize: 12.5, color: C.ink2, background: C.bg }}>
+                <span><span style={{ fontFamily: MONO, color: C.ink3, marginRight: 10 }}>{l.date}</span>{l.label}</span>
+                <span style={{ fontFamily: MONO, color: l.dir === "in" ? C.green : C.red }}>{l.dir === "in" ? "" : "-"}{money(l.amt, cur)}</span>
+              </div>
             ))}
-          </tbody>
-        </table>
-        <div className="flex gap-4" style={{ padding: "10px 14px", borderTop: `1px solid ${C.rule}` }}>
-          <span className="flex items-center gap-1.5" style={{ fontSize: 11, color: C.ink2 }}>
-            <i style={{ width: 8, height: 8, background: C.slate, borderRadius: 2, display: "inline-block" }} /> One-time
-          </span>
-          <span className="flex items-center gap-1.5" style={{ fontSize: 11, color: C.ink2 }}>
-            <i style={{ width: 8, height: 8, background: C.green, borderRadius: 2, display: "inline-block" }} /> Monitoring
-          </span>
-          <span style={{ fontSize: 11, color: C.ink3, marginLeft: "auto" }}>
-            One-time work books in the month it is handed over. Monitoring books in each month served.
-          </span>
-        </div>
+          </div>
+        ))}
       </Panel>
     </div>
   );
 }
 
-/* ------------------------------------------------------------ payments tab */
-function PaymentsTab({ projects, settings, setSettings, onOpen, onPatch }) {
-  const cur = settings.currency;
-  const [status, setStatus] = useState("");
-  const [matches, setMatches] = useState([]);
-
-  const openItems = projects.flatMap((p) => {
-    const n = pnl(p, settings);
-    const rows = [];
-    if (!p.deposit.paidAt && n.deposit > 0) rows.push({ p, stage: "deposit", label: "Deposit", amt: n.deposit, inv: p.deposit });
-    if (!p.balance.paidAt && n.balance > 0) rows.push({ p, stage: "balance", label: "Balance", amt: n.balance, inv: p.balance });
-    return rows;
-  });
-
-  async function reconcile() {
-    if (openItems.length === 0) { setStatus("Nothing outstanding to match."); return; }
-    setStatus("Checking Stripe and Mercury...");
-    try {
-      const r = await api("/api/reconcile", { method: "POST" });
-      setMatches(r.matches || []);
-      setStatus(r.note || `${r.paymentsSeen} payments seen, ${(r.matches || []).length} possible matches.`);
-      setSettings({ ...settings, lastReconcile: today() });
-    } catch (e) {
-      setStatus(`Stripe / Mercury: ${e.message}`);
-    }
-  }
-
-  function confirm(m) {
-    const name = (m.client || "").toLowerCase();
-    if (m.stage === "monitoring") {
-      const proj = projects.find((x) => (x.client || "").toLowerCase() === name);
-      if (!proj) return;
-      const month = (m.date || today()).slice(0, 7);
-      const log = proj.monitoringLog || [];
-      const next = log.some((e) => e.month === month)
-        ? log.map((e) => (e.month === month ? { ...e, paidAt: m.date } : e))
-        : [...log, { month, hours: "", note: "", paidAt: m.date }];
-      onPatch({ ...proj, monitoringLog: next });
-      setMatches(matches.filter((x) => x !== m));
-      return;
-    }
-    const row = openItems.find((r) => (r.p.client || "").toLowerCase() === name && r.stage === m.stage);
-    if (!row) return;
-    onPatch({ ...row.p, [m.stage]: { ...row.inv, paidAt: m.date } });
-    setMatches(matches.filter((x) => x !== m));
-  }
-
-  const since = settings.lastReconcile ? daysBetween(settings.lastReconcile, today()) : null;
-
+/* ------------------------------------------------------------------ gear */
+function Gear({ settings, setSettings, gmailConnected, onClose }) {
+  const s = settings;
+  const setTeam = (i, patch) => setSettings({ ...s, team: s.team.map((t, j) => (j === i ? { ...t, ...patch } : t)) });
+  const rules = s.referralRules || [];
+  const setRule = (i, patch) => setSettings({ ...s, referralRules: rules.map((r, j) => (j === i ? { ...r, ...patch } : r)) });
   return (
-    <div className="grid gap-4">
-      <Panel
-        title="Money owed to us"
-        right={<Btn kind="primary" onClick={reconcile}>Check Stripe and Mercury</Btn>}
-        pad={false}
-      >
-        <div style={{ padding: "10px 14px", borderBottom: `1px solid ${C.rule}` }}>
-          <p style={{ fontSize: 12.5, color: status ? C.ink : C.ink3 }}>
-            {status || (since === null
-              ? "Never reconciled. Run it to pull payments from Stripe and the bank."
-              : since >= 7
-              ? `Last checked ${since} days ago. Worth running again.`
-              : `Last checked ${since} days ago.`)}
-          </p>
+    <div className="grid gap-4" style={{ maxWidth: 640 }}>
+      <div className="flex items-center justify-between"><h2 style={{ fontSize: 16, fontWeight: 600 }}>Background settings</h2><Btn onClick={onClose}>Done</Btn></div>
+      <Panel title="Gmail">
+        {gmailConnected ? <Chip tone="green">connected</Chip> : <a href="/auth/google" style={{ fontSize: 13, color: C.red }}>Connect Gmail (needed for supplier emails and invoice lookup)</a>}
+        <label className="flex items-center gap-2 mt-3" style={{ fontSize: 12.5, color: C.ink2 }}>
+          <input type="checkbox" checked={!!s.autoEmails} onChange={(e) => setSettings({ ...s, autoEmails: e.target.checked })} /> Send supplier emails automatically when a project is saved
+        </label>
+      </Panel>
+      <Panel title="Team">
+        {s.team.map((t, i) => (
+          <div key={t.id} className="grid gap-2 mb-2" style={{ gridTemplateColumns: "1fr 1.4fr" }}>
+            <TextIn value={t.name} onChange={(e) => setTeam(i, { name: e.target.value })} />
+            <TextIn value={t.email} placeholder={`${t.role} email`} onChange={(e) => setTeam(i, { email: e.target.value })} />
+          </div>
+        ))}
+      </Panel>
+      <Panel title="Rates">
+        <div className="grid gap-3" style={{ gridTemplateColumns: "1fr 1fr 1fr" }}>
+          <Field label="Denis / hour"><NumIn value={s.rateDev} onChange={(e) => setSettings({ ...s, rateDev: e.target.value })} /></Field>
+          <Field label="Cas / hour"><NumIn value={s.ratePm} onChange={(e) => setSettings({ ...s, ratePm: e.target.value })} /></Field>
+          <Field label="Payment terms, days"><NumIn value={s.termsDays} onChange={(e) => setSettings({ ...s, termsDays: e.target.value })} /></Field>
         </div>
-        {openItems.length === 0 ? (
-          <p style={{ padding: 26, fontSize: 13, color: C.ink3, textAlign: "center" }}>Everything invoiced has been paid.</p>
-        ) : (
-          <table style={{ width: "100%", borderCollapse: "collapse" }}>
-            <thead>
-              <tr style={{ fontFamily: MONO, fontSize: 9.5, letterSpacing: ".08em", textTransform: "uppercase", color: C.ink3 }}>
-                {["Client", "Stage", "Amount", "Invoice", "Due", "Overdue"].map((h, i) => (
-                  <th key={h} style={{ textAlign: i === 2 || i === 5 ? "right" : "left", padding: "8px 14px", borderBottom: `1px solid ${C.rule}`, fontWeight: 400 }}>{h}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {openItems.map((r) => {
-                const od = overdueBy(r.inv, settings);
-                return (
-                  <tr key={r.p.id + r.stage} onClick={() => onOpen(r.p.id)} style={{ cursor: "pointer", borderBottom: `1px solid ${C.rule}` }}>
-                    <td style={{ padding: "10px 14px", fontSize: 13.5 }}>{r.p.client || "Untitled"}</td>
-                    <td style={{ padding: "10px 14px" }}><Chip tone={r.stage === "balance" ? "amber" : "slate"}>{r.label}</Chip></td>
-                    <td style={{ padding: "10px 14px", textAlign: "right", fontFamily: MONO, fontSize: 13 }}>{money(r.amt, cur)}</td>
-                    <td style={{ padding: "10px 14px", fontFamily: MONO, fontSize: 12, color: C.ink2 }}>{r.inv.invoiceNo || "not invoiced"}</td>
-                    <td style={{ padding: "10px 14px", fontFamily: MONO, fontSize: 12, color: C.ink2 }}>{dueDate(r.inv, settings) || "-"}</td>
-                    <td style={{ padding: "10px 14px", textAlign: "right", fontFamily: MONO, fontSize: 12.5, color: od > 0 ? C.red : C.ink2 }}>
-                      {od === null ? "-" : od > 0 ? `${od}d` : "on time"}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        )}
+        <p style={{ fontSize: 11.5, color: C.ink3, marginTop: 8 }}>Ritvik and PDF are quoted per project, so they live on the project. Gabriel's fee: rule to be decided, entered per project for now.</p>
       </Panel>
-
-      {matches.length > 0 && (
-        <Panel title="Payments that look like a match">
-          <p style={{ fontSize: 12.5, color: C.ink2, marginBottom: 12 }}>
-            Nothing is marked paid until you say so.
-          </p>
-          {matches.map((m, i) => (
-            <div key={i} className="flex items-center justify-between gap-3" style={{ padding: "9px 0", borderBottom: `1px solid ${C.rule}` }}>
-              <div>
-                <span style={{ fontSize: 13.5, fontWeight: 600 }}>{m.client}</span>
-                <span style={{ fontSize: 12.5, color: C.ink2 }}> &middot; {m.stage} &middot; {m.reference}</span>
-                <div style={{ fontFamily: MONO, fontSize: 11.5, color: C.ink3, marginTop: 2 }}>
-                  {m.source} &middot; {m.date} &middot; {money(m.amount, cur)}
-                </div>
-              </div>
-              <div className="flex items-center gap-2">
-                <Chip tone={m.certainty === "high" ? "green" : "amber"}>{m.certainty}</Chip>
-                <Btn kind="good" onClick={() => confirm(m)}>Mark paid</Btn>
-                <Btn onClick={() => setMatches(matches.filter((x) => x !== m))}>Ignore</Btn>
-              </div>
-            </div>
-          ))}
-        </Panel>
-      )}
-    </div>
-  );
-}
-
-/* ------------------------------------------------------------- timesheets */
-function weeklyEmail(member, projects, settings) {
-  const open = projects.filter((p) => p.status === "active" || p.status === "delivered");
-  const list = open.map((p) => `- ${p.client || "Untitled"}`).join("\n");
-  const week = today();
-
-  if (member.id === "dev") {
-    return {
-      subject: `Hours this week, ${week}`,
-      body: `Hi ${member.name},\n\nQuick one for the ledger. How many hours did you put into each of these this week?\n\n${list}\n\nJust reply with the project and the number of hours, nothing formal. If you touched something not on the list, add it.\n\nThanks`,
-    };
-  }
-  if (member.id === "auditor") {
-    return {
-      subject: `Audit and VPAT costs, ${week}`,
-      body: `Hi ${member.name},\n\nFor the P&L I need your project cost on the manual audit and the VPAT for these:\n\n${list}\n\nOne number per project per deliverable is enough. Also tell me which ones are finished so I know when to invoice the balance.\n\nThanks`,
-    };
-  }
-  return {
-    subject: `Project status, ${week}`,
-    body: `Hi ${member.name},\n\nWeekly check on the open manual services projects:\n\n${list}\n\nFor each one: where is it, is anything blocked, and is it ready for handover? If a project is done, say so and I will trigger the balance invoice.\n\nThanks`,
-  };
-}
-
-function TimesheetTab({ projects, settings, setSettings }) {
-  const [status, setStatus] = useState("");
-  const [preview, setPreview] = useState(null);
-
-  async function draft(member) {
-    setStatus(`Creating a draft for ${member.name}...`);
-    try {
-      await api("/api/team/draft", { method: "POST", body: JSON.stringify({ memberId: member.id }) });
-      setStatus(`Draft ready in Gmail for ${member.name}. Review it and hit send.`);
-      setSettings({ ...settings, lastTimesheetRun: today() });
-    } catch (e) {
-      setStatus(`Gmail: ${e.message}`);
-    }
-  }
-
-  const stale = settings.lastTimesheetRun ? daysBetween(settings.lastTimesheetRun, today()) : null;
-
-  return (
-    <div className="grid gap-4" style={{ maxWidth: 780 }}>
-      <Panel title="Weekly check-in">
-        <p style={{ fontSize: 13, color: C.ink2 }}>
-          {stale === null
-            ? "No check-in sent yet."
-            : stale >= 7
-            ? `Last check-in was ${stale} days ago. Time to run it again.`
-            : `Last check-in was ${stale} days ago.`}
-        </p>
-        <p style={{ fontSize: 12, color: C.ink3, marginTop: 6 }}>
-          Drafts land in your Gmail. You press send, so nothing goes out that you have not read.
-        </p>
-        {status && <p style={{ fontSize: 12.5, color: C.green, marginTop: 10 }}>{status}</p>}
+      <Panel title="Referral fee rules" right={<Btn onClick={() => setSettings({ ...s, referralRules: [...rules, { match: "", partner: "", type: "pct", value: 0 }] })}>Add</Btn>}>
+        {rules.length === 0 && <p style={{ fontSize: 12.5, color: C.ink3 }}>e.g. lead source contains "nolan" → 20% to Nolan Klein</p>}
+        {rules.map((r, i) => (
+          <div key={i} className="grid gap-2 mb-2 items-end" style={{ gridTemplateColumns: "1fr 1fr 90px 90px 30px" }}>
+            <Field label="Source contains"><TextIn value={r.match} onChange={(e) => setRule(i, { match: e.target.value })} /></Field>
+            <Field label="Paid to"><TextIn value={r.partner} onChange={(e) => setRule(i, { partner: e.target.value })} /></Field>
+            <Field label="Type"><select value={r.type} onChange={(e) => setRule(i, { type: e.target.value })} style={inputStyle}><option value="pct">%</option><option value="fixed">fixed</option></select></Field>
+            <Field label="Value"><NumIn value={r.value} onChange={(e) => setRule(i, { value: e.target.value })} /></Field>
+            <button onClick={() => setSettings({ ...s, referralRules: rules.filter((_, j) => j !== i) })} style={{ background: "none", border: "none", color: C.ink3, cursor: "pointer", fontSize: 16 }}>&times;</button>
+          </div>
+        ))}
       </Panel>
-
-      {settings.team.map((m, i) => {
-        const mail = weeklyEmail(m, projects, settings);
-        return (
-          <Panel key={m.id} title={m.role}>
-            <div className="grid gap-3" style={{ gridTemplateColumns: "1fr 1.4fr" }}>
-              <Field label="Name">
-                <TextIn
-                  value={m.name}
-                  onChange={(e) => setSettings({ ...settings, team: settings.team.map((x, j) => (j === i ? { ...x, name: e.target.value } : x)) })}
-                />
-              </Field>
-              <Field label="Email">
-                <TextIn
-                  value={m.email}
-                  placeholder="name@accessibilitychecker.org"
-                  onChange={(e) => setSettings({ ...settings, team: settings.team.map((x, j) => (j === i ? { ...x, email: e.target.value } : x)) })}
-                />
-              </Field>
-            </div>
-            <div className="flex gap-2 mt-3">
-              <Btn kind="primary" onClick={() => draft(m)}>Draft this week's email</Btn>
-              <Btn onClick={() => setPreview(preview === m.id ? null : m.id)}>
-                {preview === m.id ? "Hide" : "Preview"}
-              </Btn>
-            </div>
-            {preview === m.id && (
-              <pre
-                style={{
-                  marginTop: 12, background: C.bg, padding: 12, borderRadius: 3,
-                  fontFamily: SANS, fontSize: 12.5, color: C.ink2, whiteSpace: "pre-wrap",
-                }}
-              >
-                {mail.subject}
-                {"\n\n"}
-                {mail.body}
-              </pre>
-            )}
-          </Panel>
-        );
-      })}
     </div>
   );
 }
@@ -1433,302 +694,125 @@ function App() {
   const [projects, setProjects] = useState([]);
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [selected, setSelected] = useState(null);
+  const [filter, setFilter] = useState("all");
   const [loaded, setLoaded] = useState(false);
-  const [saveNote, setSaveNote] = useState("");
-
   const [gmailConnected, setGmailConnected] = useState(false);
+  const [note, setNote] = useState("");
+  const [gear, setGear] = useState(false);
 
   useEffect(() => {
     (async () => {
-      try {
-        const s = await api("/api/state");
-        setProjects(s.projects);
-        setSettings(s.settings);
-        setGmailConnected(s.gmailConnected);
-      } catch (e) {
-        setSaveNote(e.message);
-      }
+      try { const s = await api("/api/state"); setProjects(s.projects); setSettings(s.settings); setGmailConnected(s.gmailConnected); }
+      catch (e) { setNote(e.message); }
       setLoaded(true);
     })();
   }, []);
-
-  /* settings save whenever they change */
   useEffect(() => {
     if (!loaded) return;
-    api("/api/settings", { method: "PUT", body: JSON.stringify(settings) })
-      .then(() => setSaveNote("Saved " + new Date().toLocaleTimeString()))
-      .catch((e) => setSaveNote("Not saved: " + e.message));
+    api("/api/settings", { method: "PUT", body: JSON.stringify(settings) }).then(() => setNote("Saved")).catch((e) => setNote("Not saved: " + e.message));
   }, [settings, loaded]);
-
-  const totals = useMemo(() => {
-    return projects.reduce(
-      (a, p) => {
-        const n = pnl(p, settings);
-        a.fee += n.fee;
-        a.cost += n.cost;
-        a.margin += n.margin;
-        a.outstanding += n.outstanding;
-        a.monMargin += n.mMargin;
-        if (p.status !== "closed") {
-          a.mrr += n.mrr;
-          a.pendingMrr += n.pendingMrr;
-        }
-        return a;
-      },
-      { fee: 0, cost: 0, margin: 0, outstanding: 0, mrr: 0, pendingMrr: 0, monMargin: 0 }
-    );
-  }, [projects, settings]);
-
-  const months = useMemo(() => monthlyPnl(projects, settings), [projects, settings]);
-
-  const tasks = useMemo(
-    () => projects.flatMap((p) => tasksFor(p, settings)),
-    [projects, settings]
-  );
-
-  const cur = settings.currency;
-  const sel = projects.find((p) => p.id === selected);
 
   const upsert = (proj) => {
     setProjects((ps) => ps.map((x) => (x.id === proj.id ? proj : x)));
-    clearTimeout(upsert.t?.[proj.id]);
-    upsert.t = upsert.t || {};
-    upsert.t[proj.id] = setTimeout(() => {
-      api(`/api/projects/${proj.id}`, { method: "PUT", body: JSON.stringify(proj) })
-        .then(() => setSaveNote("Saved " + new Date().toLocaleTimeString()))
-        .catch((e) => setSaveNote("Not saved: " + e.message));
-    }, 400);
+    clearTimeout(upsert.t?.[proj.id]); upsert.t = upsert.t || {};
+    upsert.t[proj.id] = setTimeout(() => api(`/api/projects/${proj.id}`, { method: "PUT", body: JSON.stringify(proj) }).then(() => setNote("Saved")).catch((e) => setNote("Not saved: " + e.message)), 400);
   };
   const create = async (p) => {
-    await api(`/api/projects/${p.id}`, { method: "PUT", body: JSON.stringify(p) });
-    setProjects((ps) => [p, ...ps]);
+    setNote("Saving and emailing...");
+    const r = await api("/api/projects", { method: "POST", body: JSON.stringify(p) });
+    setProjects((ps) => [r.project, ...ps]);
+    setNote(r.emails.length ? `Saved. Emailed ${r.emails.join(" and ")}.` : "Saved. No emails sent, team addresses not set.");
+    setSelected(r.project.id); setTab("projects");
   };
-  const remove = async (id) => {
-    await api(`/api/projects/${id}`, { method: "DELETE" });
-    setProjects((ps) => ps.filter((x) => x.id !== id));
-  };
+  const remove = async (id) => { await api(`/api/projects/${id}`, { method: "DELETE" }); setProjects((ps) => ps.filter((x) => x.id !== id)); };
 
-  const TABS = [
-    ["projects", "Projects"],
-    ["monthly", "Monthly P&L"],
-    ["intake", "New project"],
-    ["payments", "Payments"],
-    ["reminders", `Reminders${tasks.length ? ` (${tasks.length})` : ""}`],
-    ["team", "Team check-in"],
-    ["settings", "Rates"],
-  ];
+  const cur = settings.currency;
+  const sel = projects.find((p) => p.id === selected);
+  const tasks = useMemo(() => projects.flatMap((p) => tasksFor(p, settings)), [projects, settings]);
+  const totals = useMemo(() => projects.reduce((a, p) => { const n = pnl(p, settings); a.fee += n.fee; a.margin += n.margin; a.out += n.outstanding; a.mrr += p.closed ? 0 : n.mrr; return a; }, { fee: 0, margin: 0, out: 0, mrr: 0 }), [projects, settings]);
+  const shown = projects.filter((p) => filter === "all" ? !p.closed : filter === "closed" ? p.closed : !p.closed && paymentState(p) === filter);
+
+  const TABS = [["intake", "New project"], ["projects", "Projects"], ["cash", "Cash flow"]];
 
   return (
     <div style={{ background: C.bg, minHeight: "100vh", fontFamily: SANS, color: C.ink }}>
-      <div style={{ maxWidth: 1180, margin: "0 auto", padding: "22px 20px 60px" }}>
+      <div style={{ maxWidth: 1140, margin: "0 auto", padding: "22px 20px 60px" }}>
         <header className="flex items-end justify-between flex-wrap gap-3" style={{ marginBottom: 18 }}>
           <div>
-            <h1 style={{ fontSize: 20, fontWeight: 650, letterSpacing: "-.01em" }}>
-              {"Manual Services Ledger & P&L"}
-            </h1>
-            <p style={{ fontFamily: MONO, fontSize: 11, color: C.ink3, marginTop: 3 }}>
-              AccessibilityChecker.org &middot; what we sold, what it cost, who still owes us
-            </p>
+            <h1 style={{ fontSize: 20, fontWeight: 650, letterSpacing: "-.01em" }}>{"Manual Services Ledger & P&L"}</h1>
+            <p style={{ fontFamily: MONO, fontSize: 11, color: C.ink3, marginTop: 3 }}>AccessibilityChecker.org</p>
           </div>
           <div className="flex items-center gap-3">
-            {!gmailConnected && (
-              <a href="/auth/google" style={{ fontSize: 12, color: C.red, textDecoration: "none", border: `1px solid ${C.rule}`, padding: "5px 9px", borderRadius: 3, background: C.panel }}>
-                Connect Gmail
-              </a>
-            )}
-            <span style={{ fontFamily: MONO, fontSize: 10.5, color: C.ink3 }}>{saveNote}</span>
+            <span style={{ fontFamily: MONO, fontSize: 10.5, color: C.ink3 }}>{note}</span>
+            <button onClick={() => setGear(!gear)} title="Background settings" style={{ background: "none", border: `1px solid ${C.rule}`, borderRadius: 3, cursor: "pointer", padding: "5px 8px", color: gmailConnected ? C.ink2 : C.red, fontSize: 14 }}>⚙</button>
           </div>
         </header>
 
-        <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", marginBottom: 18 }}>
-          {[
-            ["One-time booked", money(totals.fee, cur), C.ink],
-            ["One-time margin", money(totals.margin, cur), totals.margin < 0 ? C.red : C.green],
-            ["Monitoring margin", money(totals.monMargin, cur), totals.monMargin < 0 ? C.red : C.green],
-            ["Live MRR", money(totals.mrr, cur), C.green],
-            ["MRR not started", money(totals.pendingMrr, cur), C.ink3],
-            ["Unpaid", money(totals.outstanding, cur), totals.outstanding > 0 ? C.red : C.ink2],
-          ].map(([label, value, color]) => (
-            <div key={label} style={{ background: C.panel, border: `1px solid ${C.rule}`, borderRadius: 4, padding: "11px 13px" }}>
-              <div style={{ fontFamily: MONO, fontSize: 9.5, letterSpacing: ".1em", textTransform: "uppercase", color: C.ink3 }}>{label}</div>
-              <div style={{ fontFamily: MONO, fontSize: 19, marginTop: 5, color }}>{value}</div>
-            </div>
-          ))}
-        </div>
-
-        <nav className="flex gap-1 flex-wrap" style={{ borderBottom: `1px solid ${C.rule}`, marginBottom: 18 }}>
-          {TABS.map(([k, label]) => (
-            <button
-              key={k}
-              onClick={() => { setTab(k); if (k !== "projects") setSelected(null); }}
-              style={{
-                fontFamily: SANS, fontSize: 13, padding: "8px 13px", cursor: "pointer",
-                background: "transparent", border: "none",
-                borderBottom: `2px solid ${tab === k ? C.ink : "transparent"}`,
-                color: tab === k ? C.ink : C.ink3,
-                fontWeight: tab === k ? 600 : 400,
-              }}
-            >
-              {label}
-            </button>
-          ))}
-        </nav>
-
-        {tab === "intake" && (
-          <Intake
-            settings={settings}
-            onCreate={async (p) => { await create(p); setSelected(p.id); setTab("projects"); }}
-          />
-        )}
-
-        {tab === "projects" && (sel ? (
-          <Detail
-            p={sel}
-            settings={settings}
-            onChange={upsert}
-            onBack={() => setSelected(null)}
-            onDelete={async () => { await remove(sel.id); setSelected(null); }}
-          />
-        ) : (
-          <Panel title={`${projects.length} project${projects.length === 1 ? "" : "s"}`} pad={false}
-            right={<Btn onClick={() => setTab("intake")}>Add a contract</Btn>}>
-            {projects.length === 0 ? (
-              <p style={{ padding: 26, fontSize: 13, color: C.ink3, textAlign: "center" }}>
-                Upload a signed contract to start the first project.
-              </p>
-            ) : (
-              <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                <thead>
-                  <tr style={{ fontFamily: MONO, fontSize: 9.5, letterSpacing: ".08em", textTransform: "uppercase", color: C.ink3 }}>
-                    {["Client", "Sold", "One-time fee", "One-time margin", "Monitoring", "Unpaid", "Status"].map((h, i) => (
-                      <th key={h} style={{ textAlign: i > 1 && i < 6 ? "right" : "left", padding: "8px 14px", borderBottom: `1px solid ${C.rule}`, fontWeight: 400 }}>{h}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {projects.map((p) => {
-                    const n = pnl(p, settings);
-                    return (
-                      <tr key={p.id} onClick={() => setSelected(p.id)} style={{ cursor: "pointer", borderBottom: `1px solid ${C.rule}` }}>
-                        <td style={{ padding: "10px 14px", fontSize: 13.5, fontWeight: 500 }}>{p.client || "Untitled"}</td>
-                        <td style={{ padding: "10px 14px" }}>
-                          <span className="flex gap-1 flex-wrap">
-                            {Object.keys(SERVICE_LABELS).filter((k) => p.services[k]).map((k) => (
-                              <Chip key={k} tone={k === "monitoring" ? (n.state === "running" ? "green" : "amber") : "slate"}>{SHORT[k]}</Chip>
-                            ))}
-                          </span>
-                        </td>
-                        <td style={{ padding: "10px 14px", textAlign: "right", fontFamily: MONO, fontSize: 13 }}>{money(n.fee, cur)}</td>
-                        <td style={{ padding: "10px 14px", textAlign: "right", fontFamily: MONO, fontSize: 13, color: n.margin < 0 ? C.red : C.green }}>
-                          {money(n.margin, cur)} <span style={{ color: C.ink3 }}>{n.marginPct.toFixed(0)}%</span>
-                        </td>
-                        <td style={{ padding: "10px 14px", textAlign: "right", fontFamily: MONO, fontSize: 13, color: C.ink2 }}>
-                          {!p.services.monitoring ? <span style={{ color: C.ink3 }}>none</span>
-                            : n.state === "pending" ? <span style={{ color: C.amber }}>{money(n.mFee, cur)}/mo pending</span>
-                            : `${money(n.mFee, cur)}/mo`}
-                        </td>
-                        <td style={{ padding: "10px 14px", textAlign: "right", fontFamily: MONO, fontSize: 13, color: n.outstanding > 0 ? C.red : C.ink3 }}>{money(n.outstanding, cur)}</td>
-                        <td style={{ padding: "10px 14px" }}>
-                          <Chip tone={p.status === "delivered" ? "amber" : p.status === "closed" ? "slate" : "green"}>{p.status}</Chip>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            )}
-          </Panel>
-        ))}
-
-        {tab === "monthly" && <MonthlyTab months={months} settings={settings} />}
-
-        {tab === "payments" && (
-          <PaymentsTab
-            projects={projects}
-            settings={settings}
-            setSettings={setSettings}
-            onOpen={(id) => { setSelected(id); setTab("projects"); }}
-            onPatch={upsert}
-          />
-        )}
-        {tab === "reminders" && (
-          <div className="grid gap-3" style={{ maxWidth: 820 }}>
-            {(!settings.lastTimesheetRun || daysBetween(settings.lastTimesheetRun, today()) >= 7) && (
-              <div
-                onClick={() => setTab("team")}
-                style={{ background: C.panel, border: `1px solid ${C.rule}`, borderLeft: `3px solid ${C.slate}`, borderRadius: 4, padding: "12px 15px", cursor: "pointer" }}
-              >
-                <span style={{ fontSize: 13.5, fontWeight: 600 }}>Weekly check-in is due</span>
-                <p style={{ fontSize: 12.5, color: C.ink2, marginTop: 5 }}>
-                  Ask the team for hours and costs on the open projects. Drafts get created in Gmail for you to send.
-                </p>
-              </div>
-            )}
-            {(!settings.lastReconcile || daysBetween(settings.lastReconcile, today()) >= 7) && (
-              <div
-                onClick={() => setTab("payments")}
-                style={{ background: C.panel, border: `1px solid ${C.rule}`, borderLeft: `3px solid ${C.green}`, borderRadius: 4, padding: "12px 15px", cursor: "pointer" }}
-              >
-                <span style={{ fontSize: 13.5, fontWeight: 600 }}>Reconcile payments</span>
-                <p style={{ fontSize: 12.5, color: C.ink2, marginTop: 5 }}>
-                  Pull the last 60 days of incoming payments from Stripe and Mercury and match them to open invoices.
-                </p>
-              </div>
-            )}
-            {tasks.length === 0 ? (
-              <Panel><p style={{ fontSize: 13, color: C.ink3, textAlign: "center", padding: 14 }}>Nothing needs chasing.</p></Panel>
-            ) : (
-              tasks.map((t) => (
-                <div
-                  key={t.key}
-                  onClick={() => { setSelected(t.project.id); setTab("projects"); }}
-                  style={{
-                    background: C.panel, border: `1px solid ${C.rule}`, borderLeft: `3px solid ${
-                      t.level === "red" ? C.red : t.level === "amber" ? C.amber : t.level === "green" ? C.green : C.slate
-                    }`, borderRadius: 4, padding: "12px 15px", cursor: "pointer",
-                  }}
-                >
-                  <div className="flex items-center justify-between gap-3">
-                    <span style={{ fontSize: 13.5, fontWeight: 600 }}>{t.title}</span>
-                    <span style={{ fontFamily: MONO, fontSize: 11, color: C.ink3 }}>{t.project.client || "Untitled"}</span>
-                  </div>
-                  <p style={{ fontSize: 12.5, color: C.ink2, marginTop: 5 }}>{t.detail}</p>
+        {gear ? <Gear settings={settings} setSettings={setSettings} gmailConnected={gmailConnected} onClose={() => setGear(false)} /> : (
+          <>
+            <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", marginBottom: 18 }}>
+              {[["Booked", money(totals.fee, cur), C.ink], ["Margin", money(totals.margin, cur), totals.margin < 0 ? C.red : C.green], ["Unpaid", money(totals.out, cur), totals.out > 0 ? C.red : C.ink2], ["Live MRR", money(totals.mrr, cur), C.green]].map(([l, v, c]) => (
+                <div key={l} style={{ background: C.panel, border: `1px solid ${C.rule}`, borderRadius: 4, padding: "11px 13px" }}>
+                  <div style={{ fontFamily: MONO, fontSize: 9.5, letterSpacing: ".1em", textTransform: "uppercase", color: C.ink3 }}>{l}</div>
+                  <div style={{ fontFamily: MONO, fontSize: 19, marginTop: 5, color: c }}>{v}</div>
                 </div>
-              ))
-            )}
-          </div>
-        )}
+              ))}
+            </div>
 
-        {tab === "team" && (
-          <TimesheetTab projects={projects} settings={settings} setSettings={setSettings} />
-        )}
+            <nav className="flex gap-1" style={{ borderBottom: `1px solid ${C.rule}`, marginBottom: 18 }}>
+              {TABS.map(([k, l]) => (
+                <button key={k} onClick={() => { setTab(k); setSelected(null); }} style={{ fontFamily: SANS, fontSize: 13, padding: "8px 13px", cursor: "pointer", background: "transparent", border: "none", borderBottom: `2px solid ${tab === k ? C.ink : "transparent"}`, color: tab === k ? C.ink : C.ink3, fontWeight: tab === k ? 600 : 400 }}>{l}</button>
+              ))}
+            </nav>
 
-        {tab === "settings" && (
-          <div className="grid gap-4" style={{ maxWidth: 560 }}>
-            <Panel title="Rates">
-              <div className="grid gap-3" style={{ gridTemplateColumns: "1fr 1fr" }}>
-                <Field label="Developer, per hour"><NumIn value={settings.rateDev} onChange={(e) => setSettings({ ...settings, rateDev: e.target.value })} /></Field>
+            {tab === "intake" && <Intake settings={settings} onCreate={create} />}
+            {tab === "cash" && <CashFlowTab projects={projects} settings={settings} />}
+            {tab === "projects" && (sel ? (
+              <Detail p={sel} settings={settings} onChange={upsert} onBack={() => setSelected(null)} onDelete={async () => { await remove(sel.id); setSelected(null); }} />
+            ) : (
+              <div className="grid gap-4">
+                {tasks.length > 0 && (
+                  <div className="flex flex-wrap gap-2">
+                    {tasks.map((t) => (
+                      <button key={t.key} onClick={() => setSelected(t.project.id)} style={{ fontFamily: SANS, fontSize: 12, padding: "5px 10px", borderRadius: 3, cursor: "pointer", background: C.panel, border: `1px solid ${C.rule}`, borderLeft: `3px solid ${t.level === "red" ? C.red : t.level === "amber" ? C.amber : t.level === "green" ? C.green : C.slate}`, color: C.ink2 }}>
+                        <b style={{ color: C.ink }}>{t.project.client || "Untitled"}</b>: {t.title}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                <Panel pad={false} title={`${shown.length} project${shown.length === 1 ? "" : "s"}`} right={
+                  <div className="flex gap-1">
+                    {[["all", "Open"], ["awaiting-deposit", "Awaiting deposit"], ["balance-remaining", "Balance remaining"], ["paid", "Paid in full"], ["closed", "Closed"]].map(([k, l]) => (
+                      <button key={k} onClick={() => setFilter(k)} style={{ fontFamily: SANS, fontSize: 11.5, padding: "4px 9px", borderRadius: 3, cursor: "pointer", border: `1px solid ${filter === k ? C.ink : C.rule}`, background: filter === k ? C.ink : C.panel, color: filter === k ? "#fff" : C.ink2 }}>{l}</button>
+                    ))}
+                  </div>}>
+                  {shown.length === 0 ? <p style={{ padding: 26, fontSize: 13, color: C.ink3, textAlign: "center" }}>Nothing here.</p> : (
+                    <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                      <thead><tr style={{ fontFamily: MONO, fontSize: 9.5, letterSpacing: ".08em", textTransform: "uppercase", color: C.ink3 }}>
+                        {["Client", "Sold", "Deposit", "Balance", "Monitoring", "Margin"].map((h, i) => <th key={h} style={{ textAlign: i >= 5 ? "right" : "left", padding: "8px 14px", borderBottom: `1px solid ${C.rule}`, fontWeight: 400 }}>{h}</th>)}
+                      </tr></thead>
+                      <tbody>
+                        {shown.map((p) => {
+                          const n = pnl(p, settings);
+                          const pay = (paidAt, amt) => paidAt ? <Chip tone="green">paid</Chip> : <span style={{ fontFamily: MONO, fontSize: 12, color: C.amber }}>{money(amt, cur)} due</span>;
+                          return (
+                            <tr key={p.id} onClick={() => setSelected(p.id)} style={{ cursor: "pointer", borderBottom: `1px solid ${C.rule}` }}>
+                              <td style={{ padding: "10px 14px", fontSize: 13.5, fontWeight: 500 }}>{p.client || "Untitled"}</td>
+                              <td style={{ padding: "10px 14px" }}><span className="flex gap-1 flex-wrap">{Object.keys(SERVICE_LABELS).filter((k) => p.services[k]).map((k) => <Chip key={k} tone={k === "monitoring" ? (n.state === "running" ? "green" : "amber") : "slate"}>{SHORT[k]}</Chip>)}</span></td>
+                              <td style={{ padding: "10px 14px" }}>{pay(p.deposit.paidAt, n.deposit)}</td>
+                              <td style={{ padding: "10px 14px" }}>{p.deliveredAt ? pay(p.balance.paidAt, n.balance) : <span style={{ fontSize: 12, color: C.ink3 }}>in progress</span>}</td>
+                              <td style={{ padding: "10px 14px", fontSize: 12, color: C.ink2 }}>{!p.services.monitoring ? <span style={{ color: C.ink3 }}>none</span> : n.state === "running" ? `${money(n.mFee, cur)}/mo` : <span style={{ color: C.amber }}>{money(n.mFee, cur)}/mo after handover</span>}</td>
+                              <td style={{ padding: "10px 14px", textAlign: "right", fontFamily: MONO, fontSize: 13, color: n.margin < 0 ? C.red : C.green }}>{money(n.margin, cur)} <span style={{ color: C.ink3 }}>{n.marginPct.toFixed(0)}%</span></td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  )}
+                </Panel>
               </div>
-              <p style={{ fontSize: 12, color: C.ink3, marginTop: 10 }}>
-                Audit and VPAT are priced per project, so Ritvik's quote goes on the project itself. Placeholder dev rate, change it before you trust a margin.
-              </p>
-            </Panel>
-            <Panel title="Overhead applied to every project">
-              <div className="grid gap-3" style={{ gridTemplateColumns: "1fr 1fr" }}>
-                <Field label="Project management %"><NumIn value={settings.pmPct} onChange={(e) => setSettings({ ...settings, pmPct: e.target.value })} /></Field>
-                <Field label="Sales %"><NumIn value={settings.salesPct} onChange={(e) => setSettings({ ...settings, salesPct: e.target.value })} /></Field>
-              </div>
-              <p style={{ fontSize: 12, color: C.ink3, marginTop: 10 }}>
-                Charged as a percent of the contract value, not of margin.
-              </p>
-            </Panel>
-            <Panel title="Terms">
-              <div className="grid gap-3" style={{ gridTemplateColumns: "1fr 1fr" }}>
-                <Field label="Currency"><TextIn value={settings.currency} onChange={(e) => setSettings({ ...settings, currency: e.target.value })} /></Field>
-                <Field label="Payment terms, days" hint="Invoices flag red past this"><NumIn value={settings.termsDays} onChange={(e) => setSettings({ ...settings, termsDays: e.target.value })} /></Field>
-              </div>
-            </Panel>
-          </div>
+            ))}
+          </>
         )}
       </div>
     </div>
@@ -1736,6 +820,7 @@ function App() {
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+
 </script>
 </body>
 </html>
