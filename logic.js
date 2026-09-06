@@ -3,16 +3,17 @@
 const DEFAULT_SETTINGS = {
   currency: "$",
   rateDev: 30,
-  pmPct: 5,
-  salesPct: 10,
+  ratePm: 25,
   termsDays: 7,
   team: [
-    { id: "pm", role: "Project management", name: "Casandra Visser", email: "" },
-    { id: "auditor", role: "Manual audit and VPAT", name: "Ritvik", email: "" },
-    { id: "dev", role: "Developer", name: "Igor", email: "" },
+    { id: "cas", role: "Project management", name: "Casandra Visser", email: "" },
+    { id: "ritvik", role: "Manual audit and VPAT", name: "Ritvik", email: "" },
+    { id: "denis", role: "Developer", name: "Denis", email: "" },
   ],
-  lastTimesheetRun: "",
+  referralRules: [],   /* { match: "nolan", partner: "Nolan Klein", type: "pct" | "fixed", value: 20 } */
+  autoEmails: true,
   lastReconcile: "",
+  lastMonday: "",
 };
 
 const SERVICE_LABELS = {
@@ -25,22 +26,16 @@ const SERVICE_LABELS = {
 const ONE_TIME = ["remediation", "audit", "vpat", "pdf"];
 const SHORT = { remediation: "REM", audit: "AUDIT", vpat: "VPAT", pdf: "PDF", monitoring: "MON" };
 
-/* ------------------------------------------------------------------ helpers */
 const uid = () => Math.random().toString(36).slice(2, 10);
 const num = (v) => (isNaN(parseFloat(v)) ? 0 : parseFloat(v));
 const today = () => new Date().toISOString().slice(0, 10);
 const thisMonth = () => today().slice(0, 7);
-const daysBetween = (a, b) =>
-  Math.round((new Date(b) - new Date(a)) / 86400000);
-const monthName = (m) =>
-  new Date(m + "-02").toLocaleDateString("en-US", { month: "short", year: "numeric" });
+const daysBetween = (a, b) => Math.round((new Date(b) - new Date(a)) / 86400000);
+const monthName = (m) => new Date(m + "-02").toLocaleDateString("en-US", { month: "short", year: "numeric" });
 
 function money(v, cur = "$") {
   const n = num(v);
-  const s = Math.abs(n).toLocaleString("en-US", {
-    minimumFractionDigits: 0,
-    maximumFractionDigits: 0,
-  });
+  const s = Math.abs(n).toLocaleString("en-US", { maximumFractionDigits: 0 });
   return (n < 0 ? "-" : "") + cur + s;
 }
 
@@ -49,248 +44,205 @@ function newProject(partial = {}) {
     id: uid(),
     client: "",
     contractDate: today(),
-    status: "active",
+    closed: false,
     services: { remediation: true, audit: false, vpat: false, pdf: false, monitoring: false },
     projectFee: 0,
     depositPct: 50,
     monitoringMonthly: 0,
-    monitoringMonths: 12,
-    monitoringStartsAt: "",
-    monitoringLog: [],
-    lead: { source: "", partner: "", feeType: "pct", feeValue: 0, feePaid: false },
-    auditCost: 0,
-    vpatCost: 0,
-    pdfCost: 0,
-    devLog: [],
-    devRateOverride: null,
-    deposit: { invoiceNo: "", invoicedAt: "", dueAt: "", paidAt: "" },
-    balance: { invoiceNo: "", invoicedAt: "", dueAt: "", paidAt: "" },
+    lead: { source: "", partner: "" },
+    costs: {
+      audit: { amount: 0, paidAt: "", note: "" },
+      vpat: { amount: 0, paidAt: "", note: "" },
+      pdf: { amount: 0, paidAt: "", note: "" },
+      dev: { hours: 0, paidAt: "", note: "" },
+      pm: { hours: 0, paidAt: "", note: "" },
+      referral: { amount: 0, paidAt: "", note: "" },
+      sales: { amount: 0, paidAt: "", note: "" },
+    },
+    deposit: { paidAt: "", invoiceNo: "", invoicedAt: "" },
+    balance: { paidAt: "", invoiceNo: "", invoicedAt: "" },
     deliveredAt: "",
+    monitoringLog: [],
+    requests: {},
     upsellCall: { bookedAt: "", outcome: "" },
     notes: "",
     ...partial,
   };
 }
 
-function devRate(p, s) {
-  return p.devRateOverride === null || p.devRateOverride === "" ? num(s.rateDev) : num(p.devRateOverride);
-}
-
-function devHours(p) {
-  return (p.devLog || []).reduce((a, e) => a + num(e.hours), 0);
-}
-
-/* monitoring cannot run before the one-time work is handed over */
 function monitoringState(p) {
   if (!p.services.monitoring) return "none";
-  if (!p.deliveredAt) return "pending";
-  const start = p.monitoringStartsAt || p.deliveredAt;
-  return start > today() ? "pending" : "running";
+  if (!p.deliveredAt || p.deliveredAt > today()) return "pending";
+  return "running";
 }
 
-function dueDate(inv, s) {
-  if (!inv) return "";
-  if (inv.dueAt) return inv.dueAt;
-  if (!inv.invoicedAt) return "";
-  const d = new Date(inv.invoicedAt);
-  d.setDate(d.getDate() + num(s.termsDays));
-  return d.toISOString().slice(0, 10);
+function paymentState(p) {
+  const fee = num(p.projectFee);
+  const deposit = (fee * num(p.depositPct)) / 100;
+  if (!p.deposit.paidAt && deposit > 0) return "awaiting-deposit";
+  if (!p.balance.paidAt && fee - deposit > 0) return "balance-remaining";
+  return "paid";
 }
+const STATE_LABEL = { "awaiting-deposit": "Awaiting deposit", "balance-remaining": "Balance remaining", paid: "Paid in full" };
 
-function overdueBy(inv, s) {
-  const due = dueDate(inv, s);
-  return due ? daysBetween(due, today()) : null;
+function referralFor(p, s) {
+  if (num(p.costs.referral.amount)) return num(p.costs.referral.amount);
+  const src = `${p.lead.source} ${p.lead.partner}`.toLowerCase();
+  const rule = (s.referralRules || []).find((r) => r.match && src.includes(r.match.toLowerCase()));
+  if (!rule) return 0;
+  return rule.type === "pct" ? (num(p.projectFee) * num(rule.value)) / 100 : num(rule.value);
 }
 
 function pnl(p, s) {
-  const dr = devRate(p, s);
-  const dh = devHours(p);
-
-  /* ---- one time: remediation, manual audit, VPAT, PDF remediation ---- */
+  const c = p.costs;
   const fee = num(p.projectFee);
-  const referral =
-    p.lead.feeType === "pct" ? (fee * num(p.lead.feeValue)) / 100 : num(p.lead.feeValue);
-  const audit = num(p.auditCost);
-  const vpat = num(p.vpatCost);
-  const pdf = num(p.pdfCost);
-  const dev = dh * dr;
-  const labor = audit + vpat + pdf + dev;
-  const pm = (fee * num(s.pmPct)) / 100;
-  const sales = (fee * num(s.salesPct)) / 100;
-  const overhead = pm + sales;
-  const cost = referral + labor + overhead;
+  const audit = p.services.audit || p.services.remediation ? num(c.audit.amount) : 0;
+  const vpat = p.services.vpat ? num(c.vpat.amount) : 0;
+  const pdf = p.services.pdf ? num(c.pdf.amount) : 0;
+  const dev = num(c.dev.hours) * num(s.rateDev);
+  const pm = num(c.pm.hours) * num(s.ratePm);
+  const referral = referralFor(p, s);
+  const sales = num(c.sales.amount);
+  const cost = audit + vpat + pdf + dev + pm + referral + sales;
   const margin = fee - cost;
 
-  /* ---- ongoing: monitoring, one row per month actually served ---- */
   const mFee = num(p.monitoringMonthly);
-  const state = monitoringState(p);
   const log = p.monitoringLog || [];
-  const mHours = log.reduce((a, e) => a + num(e.hours), 0);
   const mRevenue = log.length * mFee;
-  const mLabor = mHours * dr;
-  const mOverhead = (mRevenue * (num(s.pmPct) + num(s.salesPct))) / 100;
-  const mCost = mLabor + mOverhead;
+  const mCost = log.reduce((a, e) => a + num(e.hours), 0) * num(s.rateDev);
   const mMargin = mRevenue - mCost;
-  const mCollected = log.filter((e) => e.paidAt).length * mFee;
-  const mOutstanding = mRevenue - mCollected;
-
-  /* typical month, for the MRR view */
-  const mAvgHours = log.length ? mHours / log.length : 0;
-  const mMonthMargin = mFee - mAvgHours * dr - (mFee * (num(s.pmPct) + num(s.salesPct))) / 100;
 
   const deposit = (fee * num(p.depositPct)) / 100;
   const balance = fee - deposit;
   const collected = (p.deposit.paidAt ? deposit : 0) + (p.balance.paidAt ? balance : 0);
+  const state = monitoringState(p);
 
   return {
-    fee, referral, labor, audit, vpat, pdf, dev, dh, dr, pm, sales, overhead, cost, margin,
+    fee, audit, vpat, pdf, dev, pm, referral, sales, cost, margin,
     marginPct: fee ? (margin / fee) * 100 : 0,
-    state, mFee, mHours, mRevenue, mLabor, mOverhead, mCost, mMargin, mCollected, mOutstanding,
-    mMonths: log.length, mAvgHours, mMonthMargin,
-    mMarginPct: mRevenue ? (mMargin / mRevenue) * 100 : 0,
+    mFee, mRevenue, mCost, mMargin, mMonths: log.length, state,
     mrr: state === "running" ? mFee : 0,
     pendingMrr: state === "pending" ? mFee : 0,
-    deposit, balance, collected,
-    outstanding: fee - collected + mOutstanding,
-    oneTimeOutstanding: fee - collected,
+    deposit, balance, collected, outstanding: fee - collected,
   };
 }
-
-/* month by month, one time recognised on handover, monitoring on the month served */
-function monthlyPnl(projects, s) {
-  const rows = {};
-  const touch = (m) =>
-    (rows[m] = rows[m] || { month: m, oneRev: 0, oneCost: 0, monRev: 0, monCost: 0 });
-
-  projects.forEach((p) => {
-    const n = pnl(p, s);
-    if (p.deliveredAt && n.fee) {
-      const r = touch(p.deliveredAt.slice(0, 7));
-      r.oneRev += n.fee;
-      r.oneCost += n.cost;
-    }
-    (p.monitoringLog || []).forEach((e) => {
-      if (!e.month) return;
-      const r = touch(e.month);
-      r.monRev += n.mFee;
-      r.monCost += num(e.hours) * n.dr + (n.mFee * (num(s.pmPct) + num(s.salesPct))) / 100;
-    });
-  });
-
-  return Object.values(rows)
-    .map((r) => ({
-      ...r,
-      oneMargin: r.oneRev - r.oneCost,
-      monMargin: r.monRev - r.monCost,
-      total: r.oneRev - r.oneCost + (r.monRev - r.monCost),
-      rev: r.oneRev + r.monRev,
-    }))
-    .sort((a, b) => (a.month < b.month ? 1 : -1));
-}
-
 
 function tasksFor(p, s) {
   const out = [];
-  const k = (t) => `${p.id}:${t}`;
-  if (p.status === "closed") return out;
+  if (p.closed) return out;
   const n = pnl(p, s);
+  const k = (t) => `${p.id}:${t}`;
 
-  if (!p.deposit.paidAt && n.deposit > 0) {
-    const od = overdueBy(p.deposit, s);
-    out.push({
-      key: k("deposit"),
-      level: od > 0 ? "red" : "amber",
-      title: `Deposit unpaid: ${money(n.deposit, s.currency)}`,
-      detail: p.deposit.invoicedAt
-        ? `Invoice ${p.deposit.invoiceNo || "?"} due ${dueDate(p.deposit, s)}, ${od > 0 ? `${od} days overdue` : `due in ${-od} days`}.`
-        : "Not invoiced yet. Work should not start before the deposit lands.",
-      project: p,
-    });
-  }
+  if (!p.deposit.paidAt && n.deposit > 0)
+    out.push({ key: k("deposit"), level: "amber", title: `Deposit unpaid ${money(n.deposit, s.currency)}`, project: p });
 
-  if (p.status === "delivered" && !p.balance.paidAt) {
-    const od = overdueBy(p.balance, s);
+  if (p.deliveredAt && !p.balance.paidAt && n.balance > 0) {
+    const inv = p.balance.invoicedAt;
     out.push({
       key: k("balance"),
-      level: od > 0 ? "red" : "amber",
-      title: `Balance unpaid: ${money(n.balance, s.currency)}`,
-      detail: p.balance.invoicedAt
-        ? `Invoice ${p.balance.invoiceNo || "?"} due ${dueDate(p.balance, s)}, ${od > 0 ? `${od} days overdue` : `due in ${-od} days`}.`
-        : "Delivered but the balance has not been invoiced.",
+      level: inv && daysBetween(inv, today()) > s.termsDays ? "red" : "amber",
+      title: inv ? `Balance overdue ${money(n.balance, s.currency)}` : `Invoice the balance ${money(n.balance, s.currency)}`,
       project: p,
     });
   }
 
-  if (p.status === "delivered" && !p.services.monitoring && !p.upsellCall.bookedAt) {
-    out.push({
-      key: k("upsell"),
-      level: "slate",
-      title: "Book the monitoring call",
-      detail:
-        "No monitoring on this contract. Sales should call before the site drifts out of compliance: core updates, plugin updates and client edits are not covered once remediation ends.",
-      project: p,
-    });
-  }
+  if (p.deliveredAt && !p.services.monitoring && !p.upsellCall.bookedAt)
+    out.push({ key: k("upsell"), level: "slate", title: "Book the monitoring call", project: p });
 
-  if (p.services.monitoring && p.status !== "draft") {
-    const st = monitoringState(p);
-    if (st === "pending") {
-      out.push({
-        key: k("monitoring-pending"),
-        level: "slate",
-        title: `Monitoring signed but not started: ${money(n.mFee, s.currency)}/mo`,
-        detail: p.deliveredAt
-          ? `Starts ${p.monitoringStartsAt || p.deliveredAt}. Not counted in MRR until then.`
-          : "Starts once remediation is handed over. Not counted in MRR yet.",
-        project: p,
-      });
-    } else if (st === "running" && !(p.monitoringLog || []).some((e) => e.month === thisMonth())) {
-      out.push({
-        key: k("monitoring"),
-        level: "green",
-        title: `Log ${monthName(thisMonth())} monitoring for ${p.client || "this client"}`,
-        detail: `${money(n.mFee, s.currency)}/mo. Run the scan, fix what it finds, then log the dev hours so the month has a real margin.`,
-        project: p,
-      });
-    }
-  }
+  if (monitoringState(p) === "running" && !(p.monitoringLog || []).some((e) => e.month === thisMonth()))
+    out.push({ key: k("mon"), level: "green", title: `Log ${monthName(thisMonth())} monitoring hours`, project: p });
 
-  if (p.lead.partner && !p.lead.feePaid && num(n.referral) > 0 && p.deposit.paidAt) {
-    out.push({
-      key: k("referral"),
-      level: "amber",
-      title: `Referral fee owed to ${p.lead.partner}: ${money(n.referral, s.currency)}`,
-      detail: "Deposit has landed, so the payout is due.",
-      project: p,
-    });
-  }
   return out;
 }
 
+function cashFlow(projects, s) {
+  const rows = {};
+  const touch = (m) => (rows[m] = rows[m] || { month: m, in: 0, out: 0, lines: [] });
+  const add = (date, amt, label, dir) => {
+    if (!date || !amt) return;
+    const r = touch(date.slice(0, 7));
+    r[dir] += amt;
+    r.lines.push({ date, amt, label, dir });
+  };
 
-function weeklyEmail(member, projects, settings) {
-  const open = projects.filter((p) => p.status === "active" || p.status === "delivered");
-  const list = open.map((p) => `- ${p.client || "Untitled"}`).join("\n");
-  const week = today();
+  projects.forEach((p) => {
+    const n = pnl(p, s);
+    const who = p.client || "Untitled";
+    add(p.deposit.paidAt, n.deposit, `${who}, deposit`, "in");
+    add(p.balance.paidAt, n.balance, `${who}, balance`, "in");
+    (p.monitoringLog || []).forEach((e) => add(e.paidAt, n.mFee, `${who}, monitoring ${monthName(e.month)}`, "in"));
 
-  if (member.id === "dev") {
+    const c = p.costs;
+    add(c.audit.paidAt, n.audit, `${who}, audit, Ritvik`, "out");
+    add(c.vpat.paidAt, n.vpat, `${who}, VPAT, Ritvik`, "out");
+    add(c.pdf.paidAt, n.pdf, `${who}, PDF`, "out");
+    add(c.dev.paidAt, n.dev, `${who}, dev, Denis`, "out");
+    add(c.pm.paidAt, n.pm, `${who}, PM, Cas`, "out");
+    add(c.referral.paidAt, n.referral, `${who}, referral, ${p.lead.partner || "partner"}`, "out");
+    add(c.sales.paidAt, n.sales, `${who}, sales fee`, "out");
+  });
+
+  return Object.values(rows)
+    .map((r) => ({ ...r, net: r.in - r.out, lines: r.lines.sort((a, b) => (a.date < b.date ? -1 : 1)) }))
+    .sort((a, b) => (a.month < b.month ? 1 : -1));
+}
+
+/* -------------------------------------------------- supplier emails */
+const TAG = (p) => `[Ledger ${p.id}]`;
+
+function supplierEmail(kind, p, member, cc) {
+  const sold = Object.keys(SERVICE_LABELS).filter((k) => p.services[k]).map((k) => SERVICE_LABELS[k]).join(", ");
+  const who = p.client || "the client";
+  const first = (member.name || "").split(" ")[0];
+
+  if (kind === "ritvik") {
     return {
-      subject: `Hours this week, ${week}`,
-      body: `Hi ${member.name},\n\nQuick one for the ledger. How many hours did you put into each of these this week?\n\n${list}\n\nJust reply with the project and the number of hours, nothing formal. If you touched something not on the list, add it.\n\nThanks`,
+      to: member.email,
+      cc: cc?.email || "",
+      subject: `${who}: audit cost for the P&L ${TAG(p)}`,
+      body:
+`Hi ${first},
+
+This is an automated email from the manual services P&L Danny built.
+
+New project: ${who}
+Sold: ${sold}
+
+For the P&L I need your cost on this one:
+- Manual audit: $
+${p.services.vpat ? "- VPAT: $\n" : ""}- Re-audit or QA rounds, if any: $
+
+Reply to this email with the numbers, one per line. Nothing else needed.
+
+Thanks`,
     };
   }
-  if (member.id === "auditor") {
-    return {
-      subject: `Audit and VPAT costs, ${week}`,
-      body: `Hi ${member.name},\n\nFor the P&L I need your project cost on the manual audit and the VPAT for these:\n\n${list}\n\nOne number per project per deliverable is enough. Also tell me which ones are finished so I know when to invoice the balance.\n\nThanks`,
-    };
-  }
+
   return {
-    subject: `Project status, ${week}`,
-    body: `Hi ${member.name},\n\nWeekly check on the open manual services projects:\n\n${list}\n\nFor each one: where is it, is anything blocked, and is it ready for handover? If a project is done, say so and I will trigger the balance invoice.\n\nThanks`,
+    to: member.email,
+    cc: cc?.email || "",
+    subject: `${who}: hours for the P&L ${TAG(p)}`,
+    body:
+`Hi ${first},
+
+This is an automated email from the manual services P&L Danny built.
+
+Project: ${who}
+Sold: ${sold}
+
+Reply with:
+- Denis dev hours so far: 
+- Your project management hours so far: 
+${p.services.pdf ? "- PDF remediation cost: $\n" : ""}- Handed over to the client? (yes/no, and the date if yes)
+
+One number per line. Nothing else needed.
+
+Thanks`,
   };
 }
 
-
-
-export { DEFAULT_SETTINGS, SERVICE_LABELS, ONE_TIME, SHORT, uid, num, today, thisMonth, daysBetween, monthName, money, newProject, devRate, devHours, monitoringState, dueDate, overdueBy, pnl, monthlyPnl, tasksFor, weeklyEmail };
+export {
+  DEFAULT_SETTINGS, SERVICE_LABELS, ONE_TIME, SHORT, STATE_LABEL, TAG,
+  uid, num, today, thisMonth, daysBetween, monthName, money,
+  newProject, monitoringState, paymentState, referralFor, pnl, tasksFor, cashFlow, supplierEmail,
+};
