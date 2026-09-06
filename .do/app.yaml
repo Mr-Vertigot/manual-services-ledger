@@ -1,0 +1,40 @@
+name: manual-services-ledger
+region: sgp
+services:
+  - name: web
+    dockerfile_path: Dockerfile
+    source_dir: /
+    github:
+      repo: Mr-Vertigot/manual-services-ledger
+      branch: main
+      deploy_on_push: true
+    http_port: 8080
+    instance_size_slug: basic-xxs
+    instance_count: 1
+    envs:
+      - key: DATABASE_URL
+        scope: RUN_TIME
+        value: ${db.DATABASE_URL}
+      - key: APP_URL
+        scope: RUN_TIME
+        value: ${APP_URL}
+      - key: TZ
+        value: Asia/Bangkok
+      - key: OWNER_EMAIL
+        value: danny@accessibilitychecker.org
+      - key: APP_PASSWORD
+        type: SECRET
+      - key: ANTHROPIC_API_KEY
+        type: SECRET
+      - key: STRIPE_SECRET_KEY
+        type: SECRET
+      - key: MERCURY_API_TOKEN
+        type: SECRET
+      - key: GOOGLE_CLIENT_ID
+        type: SECRET
+      - key: GOOGLE_CLIENT_SECRET
+        type: SECRET
+databases:
+  - name: db
+    engine: PG
+    production: false
