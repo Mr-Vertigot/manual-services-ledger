@@ -260,6 +260,26 @@ Thanks`,
 }
 
 
+/* upgrade projects saved under an older shape */
+function normalize(p) {
+  const d = newProject();
+  const costs = Object.fromEntries(Object.keys(d.costs).map((k) => [k, { ...d.costs[k], ...((p.costs || {})[k] || {}) }]));
+  return {
+    ...d, ...p,
+    services: { ...d.services, ...(p.services || {}) },
+    costs,
+    lead: { ...d.lead, ...(p.lead || {}) },
+    deposit: { ...d.deposit, ...(p.deposit || {}) },
+    balance: { ...d.balance, ...(p.balance || {}) },
+    upsellCall: { ...d.upsellCall, ...(p.upsellCall || {}) },
+    monitoringLog: Array.isArray(p.monitoringLog) ? p.monitoringLog : [],
+    requests: p.requests || {},
+    stripeInvoices: p.stripeInvoices || [],
+    deliveredAt: p.deliveredAt || "",
+    closed: !!p.closed || p.status === "closed",
+  };
+}
+
 
 /* ------------------------------------------------------------------ tokens */
 const C = {
@@ -330,7 +350,7 @@ function PayLine({ label, amount, paidAt, onChange, cur, muted, hint }) {
         <span style={{ fontFamily: MONO, fontSize: 13 }}>{money(amount, cur)}</span>
         {onChange && (paidAt
           ? <span className="flex items-center gap-2"><Chip tone="green">paid {paidAt}</Chip><button onClick={() => onChange("")} style={{ background: "none", border: "none", color: C.ink3, cursor: "pointer", fontSize: 12 }}>undo</button></span>
-          : <Btn kind="good" onClick={() => onChange(today())}>Mark paid</Btn>)}
+          : <span className="flex items-center gap-1"><input type="date" defaultValue={today()} id={`pd-${label}`} style={{ ...inputStyle, width: 140, padding: "5px 7px" }} /><Btn kind="good" onClick={() => onChange(document.getElementById(`pd-${label}`).value || today())}>Mark paid</Btn></span>)}
       </div>
     </div>
   );
@@ -688,6 +708,110 @@ function Gear({ settings, setSettings, gmailConnected, onClose }) {
   );
 }
 
+/* -------------------------------------------------------- stripe inbox */
+function StripeInbox({ projects, onCreate, onPatch, settings }) {
+  const [items, setItems] = useState(null);
+  const [status, setStatus] = useState("");
+  const [target, setTarget] = useState({});
+  const cur = settings.currency;
+  async function load() {
+    setStatus("Reading Stripe invoices...");
+    try { const r = await api("/api/stripe/invoices"); setItems(r); setStatus(r.length ? "" : "Nothing new in Stripe."); }
+    catch (e) { setStatus(e.message); }
+  }
+  useEffect(() => { load(); }, []);
+  if (items === null || (items.length === 0 && !status)) return status ? <p style={{ fontSize: 12, color: C.ink3, marginBottom: 10 }}>{status}</p> : null;
+
+  async function addAsProject(inv) {
+    const p = newProject({
+      client: inv.client, contractDate: inv.createdAt, services: inv.services,
+      projectFee: inv.amount, depositPct: 100, lead: { source: "Cas, direct", partner: "" },
+      deposit: { paidAt: inv.paidAt, invoiceNo: inv.number, invoicedAt: inv.createdAt },
+      deliveredAt: inv.paidAt ? inv.createdAt : "", stripeInvoices: [inv.id], notes: inv.lines.join("; "),
+    });
+    await onCreate(p, { quiet: true });
+    setItems(items.filter((x) => x.id !== inv.id));
+  }
+  function attach(inv) {
+    const [pid, stage] = (target[inv.id] || "").split(":");
+    const proj = projects.find((x) => x.id === pid);
+    if (!proj || !stage) return;
+    onPatch({ ...proj, [stage]: { ...proj[stage], paidAt: inv.paidAt, invoiceNo: inv.number, invoicedAt: inv.createdAt }, stripeInvoices: [...(proj.stripeInvoices || []), inv.id] });
+    setItems(items.filter((x) => x.id !== inv.id));
+  }
+  return (
+    <Panel title={`Stripe invoices not in the ledger (${items.length})`} right={<Btn onClick={load}>Refresh</Btn>} pad={false}>
+      {status && <p style={{ fontSize: 12, color: C.ink3, padding: "8px 14px" }}>{status}</p>}
+      {items.map((inv) => (
+        <div key={inv.id} className="flex items-center justify-between gap-3 flex-wrap" style={{ padding: "9px 14px", borderBottom: `1px solid ${C.rule}` }}>
+          <div style={{ minWidth: 260 }}>
+            <div style={{ fontSize: 13.5, fontWeight: 600 }}>{inv.client || inv.email || "Unknown"} <span style={{ fontFamily: MONO, fontWeight: 400, marginLeft: 8 }}>{money(inv.amount, cur)}</span> <Chip tone={inv.status === "paid" ? "green" : "amber"}>{inv.status === "paid" ? `paid ${inv.paidAt}` : `open, due ${inv.dueAt || "?"}`}</Chip></div>
+            <div style={{ fontSize: 11.5, color: C.ink3, marginTop: 2 }}>{inv.number} · {inv.lines.join("; ").slice(0, 90) || "no line description"}</div>
+          </div>
+          <div className="flex items-center gap-2">
+            <select value={target[inv.id] || ""} onChange={(e) => setTarget({ ...target, [inv.id]: e.target.value })} style={{ ...inputStyle, width: 220, padding: "5px 7px" }}>
+              <option value="">Attach to existing...</option>
+              {projects.filter((p) => !p.closed).flatMap((p) => [
+                <option key={p.id + "d"} value={`${p.id}:deposit`}>{p.client}: deposit</option>,
+                <option key={p.id + "b"} value={`${p.id}:balance`}>{p.client}: balance</option>,
+              ])}
+            </select>
+            <Btn onClick={() => attach(inv)} disabled={!target[inv.id]}>Attach</Btn>
+            <Btn kind="primary" onClick={() => addAsProject(inv)}>New project</Btn>
+          </div>
+        </div>
+      ))}
+    </Panel>
+  );
+}
+
+/* ------------------------------------------------------------ reconcile */
+function Reconcile({ projects, onPatch, settings, setSettings }) {
+  const [status, setStatus] = useState("");
+  const [matches, setMatches] = useState([]);
+  const cur = settings.currency;
+  async function run() {
+    setStatus("Checking Stripe and Mercury...");
+    try {
+      const r = await api("/api/reconcile", { method: "POST" });
+      setMatches(r.matches || []);
+      setStatus(r.note || `${r.paymentsSeen} payments seen, ${(r.matches || []).length} look like yours.`);
+      setSettings({ ...settings, lastReconcile: today() });
+    } catch (e) { setStatus(e.message); }
+  }
+  function confirm(m) {
+    const proj = projects.find((x) => (x.client || "").toLowerCase() === (m.client || "").toLowerCase());
+    if (!proj) return;
+    if (m.stage === "monitoring") {
+      const month = (m.date || today()).slice(0, 7);
+      const log = proj.monitoringLog || [];
+      onPatch({ ...proj, monitoringLog: log.some((e) => e.month === month) ? log.map((e) => (e.month === month ? { ...e, paidAt: m.date } : e)) : [...log, { month, hours: 0, paidAt: m.date }] });
+    } else {
+      onPatch({ ...proj, [m.stage]: { ...proj[m.stage], paidAt: m.date } });
+    }
+    setMatches(matches.filter((x) => x !== m));
+  }
+  const since = settings.lastReconcile ? daysBetween(settings.lastReconcile, today()) : null;
+  return (
+    <div className="flex items-center justify-between gap-3 flex-wrap" style={{ background: C.panel, border: `1px solid ${C.rule}`, borderRadius: 4, padding: "10px 14px" }}>
+      <span style={{ fontSize: 12.5, color: C.ink2 }}>
+        {status || (since === null ? "Payments are matched from Stripe and Mercury. Never checked yet." : `Last checked ${since === 0 ? "today" : `${since} days ago`}. Runs every Monday too.`)}
+      </span>
+      <Btn kind="primary" onClick={run}>Check Stripe and Mercury</Btn>
+      {matches.length > 0 && (
+        <div style={{ width: "100%", borderTop: `1px solid ${C.rule}`, marginTop: 6, paddingTop: 6 }}>
+          {matches.map((m, i) => (
+            <div key={i} className="flex items-center justify-between gap-3" style={{ padding: "7px 0", borderBottom: `1px solid ${C.rule}` }}>
+              <span style={{ fontSize: 13 }}><b>{m.client}</b> {m.stage} · <span style={{ fontFamily: MONO }}>{money(m.amount, cur)}</span> · {m.source} {m.date} · {m.reference}</span>
+              <span className="flex items-center gap-2"><Chip tone={m.certainty === "high" ? "green" : "amber"}>{m.certainty}</Chip><Btn kind="good" onClick={() => confirm(m)}>Yes, that's it</Btn><Btn onClick={() => setMatches(matches.filter((x) => x !== m))}>No</Btn></span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ------------------------------------------------------------------ app */
 function App() {
   const [tab, setTab] = useState("projects");
@@ -717,12 +841,12 @@ function App() {
     clearTimeout(upsert.t?.[proj.id]); upsert.t = upsert.t || {};
     upsert.t[proj.id] = setTimeout(() => api(`/api/projects/${proj.id}`, { method: "PUT", body: JSON.stringify(proj) }).then(() => setNote("Saved")).catch((e) => setNote("Not saved: " + e.message)), 400);
   };
-  const create = async (p) => {
+  const create = async (p, opts = {}) => {
     setNote("Saving and emailing...");
     const r = await api("/api/projects", { method: "POST", body: JSON.stringify(p) });
     setProjects((ps) => [r.project, ...ps]);
     setNote(r.emails.length ? `Saved. Emailed ${r.emails.join(" and ")}.` : "Saved. No emails sent, team addresses not set.");
-    setSelected(r.project.id); setTab("projects");
+    if (!opts.quiet) { setSelected(r.project.id); setTab("projects"); }
   };
   const remove = async (id) => { await api(`/api/projects/${id}`, { method: "DELETE" }); setProjects((ps) => ps.filter((x) => x.id !== id)); };
 
@@ -751,7 +875,7 @@ function App() {
         {gear ? <Gear settings={settings} setSettings={setSettings} gmailConnected={gmailConnected} onClose={() => setGear(false)} /> : (
           <>
             <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", marginBottom: 18 }}>
-              {[["Booked", money(totals.fee, cur), C.ink], ["Margin", money(totals.margin, cur), totals.margin < 0 ? C.red : C.green], ["Unpaid", money(totals.out, cur), totals.out > 0 ? C.red : C.ink2], ["Live MRR", money(totals.mrr, cur), C.green]].map(([l, v, c]) => (
+              {[["Booked", money(totals.fee, cur), C.ink], ["Margin", money(totals.margin, cur), totals.margin < 0 ? C.red : C.green], ["Unpaid", money(totals.out, cur), totals.out > 0 ? C.red : C.ink2]].map(([l, v, c]) => (
                 <div key={l} style={{ background: C.panel, border: `1px solid ${C.rule}`, borderRadius: 4, padding: "11px 13px" }}>
                   <div style={{ fontFamily: MONO, fontSize: 9.5, letterSpacing: ".1em", textTransform: "uppercase", color: C.ink3 }}>{l}</div>
                   <div style={{ fontFamily: MONO, fontSize: 19, marginTop: 5, color: c }}>{v}</div>
@@ -767,6 +891,7 @@ function App() {
 
             {tab === "intake" && <Intake settings={settings} onCreate={create} />}
             {tab === "cash" && <CashFlowTab projects={projects} settings={settings} />}
+            {tab === "projects" && !sel && <div className="grid gap-3" style={{ marginBottom: 14 }}><StripeInbox projects={projects} onCreate={create} onPatch={upsert} settings={settings} /><Reconcile projects={projects} onPatch={upsert} settings={settings} setSettings={setSettings} /></div>}
             {tab === "projects" && (sel ? (
               <Detail p={sel} settings={settings} onChange={upsert} onBack={() => setSelected(null)} onDelete={async () => { await remove(sel.id); setSelected(null); }} />
             ) : (

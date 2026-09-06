@@ -275,3 +275,44 @@ export async function chartmogulMrr(clientName) {
   const mrr = (subs.entries || []).filter((x) => x.status === "active").reduce((a, x) => a + (x.mrr || 0) / 100, 0);
   return { found: true, name: cust.name, mrr, customerUuid: cust.uuid };
 }
+
+/* ------------------------------------------------- Stripe one-off invoices */
+export async function stripeInvoices(days = 120) {
+  if (!process.env.STRIPE_SECRET_KEY) throw new Error("STRIPE_SECRET_KEY is not configured on the server.");
+  const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+  const since = Math.floor(Date.now() / 1000) - days * 86400;
+  const out = [];
+  for await (const inv of stripe.invoices.list({ created: { gte: since }, limit: 100, expand: ["data.customer"] })) {
+    if (inv.subscription) continue;                       /* SaaS lives in ChartMogul */
+    if (!["open", "paid", "uncollectible"].includes(inv.status)) continue;
+    const paidAt = inv.status_transitions?.paid_at ? new Date(inv.status_transitions.paid_at * 1000).toISOString().slice(0, 10) : "";
+    out.push({
+      id: inv.id,
+      number: inv.number || "",
+      client: inv.customer_name || inv.customer?.name || inv.customer_email || "",
+      email: inv.customer_email || inv.customer?.email || "",
+      amount: (inv.amount_due || inv.total || 0) / 100,
+      currency: (inv.currency || "usd").toUpperCase(),
+      status: inv.status,
+      createdAt: new Date(inv.created * 1000).toISOString().slice(0, 10),
+      dueAt: inv.due_date ? new Date(inv.due_date * 1000).toISOString().slice(0, 10) : "",
+      paidAt,
+      lines: (inv.lines?.data || []).map((l) => l.description || "").filter(Boolean).slice(0, 5),
+      url: inv.hosted_invoice_url || "",
+    });
+  }
+  return out;
+}
+
+/* guess what was sold from the invoice line text */
+export function guessServices(lines) {
+  const t = (lines || []).join(" ").toLowerCase();
+  const s = { remediation: false, audit: false, vpat: false, pdf: false, monitoring: false };
+  if (/pdf/.test(t)) s.pdf = true;
+  if (/vpat|acr|conformance report/.test(t)) s.vpat = true;
+  if (/monitor/.test(t)) s.monitoring = true;
+  if (/remediat|fix/.test(t)) s.remediation = true;
+  if (/audit/.test(t) && !s.remediation) s.audit = true;
+  if (!Object.values(s).some(Boolean)) s.audit = true;
+  return s;
+}

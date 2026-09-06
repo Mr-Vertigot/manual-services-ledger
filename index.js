@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { migrate, listProjects, upsertProject, deleteProject, getKV, setKV } from "./db.js";
 import {
   parseContract, findInvoicesInGmail, sendGmail, readSupplierReplies,
-  incomingPayments, matchPayments, googleAuthUrl, storeGoogleCode, chartmogulMrr,
+  incomingPayments, matchPayments, googleAuthUrl, storeGoogleCode, chartmogulMrr, stripeInvoices, guessServices,
 } from "./integrations.js";
 import { pnl, monitoringState, tasksFor, supplierEmail, TAG, DEFAULT_SETTINGS, num, today } from "./logic.js";
 
@@ -129,6 +129,13 @@ app.post("/api/projects/:id/ingest", wrap(async (req, res) => {
   res.json(await ingestReplies(p));
 }));
 
+/* Stripe invoices that are not yet linked to a project */
+app.get("/api/stripe/invoices", wrap(async (req, res) => {
+  const [invoices, projects] = await Promise.all([stripeInvoices(120), listProjects()]);
+  const linked = new Set(projects.flatMap((p) => p.stripeInvoices || []));
+  res.json(invoices.filter((i) => !linked.has(i.id)).map((i) => ({ ...i, services: guessServices(i.lines) })));
+}));
+
 /* ---------------------------------------------------------- AI + mail */
 app.post("/api/parse", upload.single("file"), wrap(async (req, res) => {
   res.json(await parseContract({ mode: req.body.mode, file: req.file, text: req.body.text }));
@@ -154,7 +161,7 @@ async function reconcileAll() {
     if (!p.balance.paidAt && n.balance > 0) open.push({ client: p.client, stage: "balance", amount: n.balance, invoiceNo: p.balance.invoiceNo });
     if (monitoringState(p) === "running") open.push({ client: p.client, stage: "monitoring", amount: n.mFee, invoiceNo: "monthly" });
   }
-  const payments = await incomingPayments(45);
+  const payments = await incomingPayments(120);
   const result = await matchPayments(payments, open);
   await setKV("settings", { ...s, lastReconcile: today() });
   return { ...result, paymentsSeen: payments.length };

@@ -261,6 +261,7 @@ function normalize(p) {
     upsellCall: { ...d.upsellCall, ...(p.upsellCall || {}) },
     monitoringLog: Array.isArray(p.monitoringLog) ? p.monitoringLog : [],
     requests: p.requests || {},
+    stripeInvoices: p.stripeInvoices || [],
     deliveredAt: p.deliveredAt || "",
     closed: !!p.closed || p.status === "closed",
   };
