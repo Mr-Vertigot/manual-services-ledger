@@ -1,4 +1,5 @@
 import pg from "pg";
+import { normalize } from "./logic.js";
 
 const { Pool } = pg;
 export const pool = new Pool({
@@ -23,7 +24,7 @@ export async function migrate() {
 
 export async function listProjects() {
   const { rows } = await pool.query("select data from projects order by updated_at desc");
-  return rows.map((r) => r.data);
+  return rows.map((r) => normalize(r.data));
 }
 
 export async function upsertProject(p) {
