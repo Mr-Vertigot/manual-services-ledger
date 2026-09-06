@@ -1,0 +1,38 @@
+services:
+  - type: web
+    name: manual-services-ledger
+    runtime: docker
+    plan: starter
+    region: singapore
+    autoDeploy: true
+    healthCheckPath: /login.html
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: ledger-db
+          property: connectionString
+      - key: APP_URL
+        fromService:
+          type: web
+          name: manual-services-ledger
+          envVarKey: RENDER_EXTERNAL_URL
+      - key: TZ
+        value: Asia/Bangkok
+      - key: OWNER_EMAIL
+        value: danny@accessibilitychecker.org
+      - key: APP_PASSWORD
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: MERCURY_API_TOKEN
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+databases:
+  - name: ledger-db
+    plan: free
+    region: singapore
