@@ -143,3 +143,6 @@ app.get("/", (req, res) => res.sendFile(path.join(__dirname, "index.html")));
 
 const port = process.env.PORT || 8080;
 migrate().then(() => app.listen(port, () => console.log(`ledger on :${port}`)));
+
+/* health check target and direct visits */
+app.get("/login.html", (req, res) => res.sendFile(path.join(__dirname, "login.html")));
