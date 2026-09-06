@@ -5,10 +5,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { migrate, listProjects, upsertProject, deleteProject, getKV, setKV } from "./db.js";
 import {
-  parseContract, findInvoicesInGmail, createGmailDraft, sendGmail,
-  incomingPayments, matchPayments, googleAuthUrl, storeGoogleCode,
+  parseContract, findInvoicesInGmail, sendGmail, readSupplierReplies,
+  incomingPayments, matchPayments, googleAuthUrl, storeGoogleCode, chartmogulMrr,
 } from "./integrations.js";
-import { pnl, monitoringState, tasksFor, weeklyEmail, DEFAULT_SETTINGS } from "./logic.js";
+import { pnl, monitoringState, tasksFor, supplierEmail, TAG, DEFAULT_SETTINGS, num, today } from "./logic.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -29,9 +29,9 @@ app.post("/login", (req, res) => {
   }
   res.status(401).json({ error: "Wrong password" });
 });
+app.get("/login.html", (req, res) => res.sendFile(path.join(__dirname, "login.html")));
 app.use((req, res, next) => {
-  if (req.path.startsWith("/auth/google")) return next();
-  if (req.path === "/login" || req.path === "/login.html") return next();
+  if (req.path.startsWith("/auth/google") || req.path === "/login") return next();
   if (!authed(req)) {
     if (req.path.startsWith("/api/")) return res.status(401).json({ error: "Sign in first" });
     return res.sendFile(path.join(__dirname, "login.html"));
@@ -48,20 +48,86 @@ app.get("/auth/google/callback", async (req, res) => {
   catch (e) { res.status(500).send(e.message); }
 });
 
-/* ------------------------------------------------------------- data */
 const wrap = (fn) => (req, res) => fn(req, res).catch((e) => res.status(500).json({ error: e.message }));
+async function settings() { return { ...DEFAULT_SETTINGS, ...(await getKV("settings", {})) }; }
 
+/* ------------------------------------------------------------- data */
 app.get("/api/state", wrap(async (req, res) => {
-  const [projects, settings, gmail] = await Promise.all([
-    listProjects(),
-    getKV("settings", DEFAULT_SETTINGS),
-    getKV("google_tokens"),
-  ]);
-  res.json({ projects, settings: { ...DEFAULT_SETTINGS, ...settings }, gmailConnected: !!gmail });
+  const [projects, s, gmail] = await Promise.all([listProjects(), settings(), getKV("google_tokens")]);
+  res.json({ projects, settings: s, gmailConnected: !!gmail, chartmogul: !!process.env.CHARTMOGUL_API_KEY });
 }));
 app.put("/api/settings", wrap(async (req, res) => res.json(await setKV("settings", req.body))));
 app.put("/api/projects/:id", wrap(async (req, res) => res.json(await upsertProject({ ...req.body, id: req.params.id }))));
 app.delete("/api/projects/:id", wrap(async (req, res) => { await deleteProject(req.params.id); res.json({ ok: true }); }));
+
+/* create = save + fire the supplier emails automatically */
+app.post("/api/projects", wrap(async (req, res) => {
+  const p = await upsertProject(req.body);
+  const s = await settings();
+  const sent = await sendSupplierRequests(p, s, ["ritvik", "cas"]);
+  res.json({ project: sent, emails: Object.keys(sent.requests || {}) });
+}));
+
+async function sendSupplierRequests(p, s, kinds) {
+  const ritvik = s.team.find((t) => t.id === "ritvik");
+  const cas = s.team.find((t) => t.id === "cas");
+  const requests = { ...(p.requests || {}) };
+  for (const kind of kinds) {
+    const member = kind === "ritvik" ? ritvik : cas;
+    const cc = kind === "ritvik" ? cas : null;
+    if (!member?.email || requests[kind]) continue;
+    const mail = supplierEmail(kind, p, member, cc);
+    if (s.autoEmails) {
+      try {
+        const threadId = await sendGmail(mail);
+        requests[kind] = { sentAt: today(), threadId, subject: mail.subject };
+      } catch (e) {
+        requests[kind] = { error: e.message };
+      }
+    }
+  }
+  const out = { ...p, requests };
+  await upsertProject(out);
+  return out;
+}
+
+app.post("/api/projects/:id/request/:kind", wrap(async (req, res) => {
+  const p = (await listProjects()).find((x) => x.id === req.params.id);
+  if (!p) return res.status(404).json({ error: "No such project" });
+  const s = await settings();
+  const cleared = { ...p, requests: { ...(p.requests || {}), [req.params.kind]: undefined } };
+  res.json(await sendSupplierRequests(cleared, s, [req.params.kind]));
+}));
+
+/* preview only, nothing sent */
+app.get("/api/projects/:id/preview/:kind", wrap(async (req, res) => {
+  const p = (await listProjects()).find((x) => x.id === req.params.id);
+  const s = await settings();
+  const member = s.team.find((t) => t.id === req.params.kind) || { name: req.params.kind, email: "" };
+  const cas = s.team.find((t) => t.id === "cas");
+  res.json(supplierEmail(req.params.kind, p, member, req.params.kind === "ritvik" ? cas : null));
+}));
+
+/* pull replies into the cost lines */
+async function ingestReplies(p) {
+  const r = await readSupplierReplies(p, TAG(p));
+  if (!r) return p;
+  const c = { ...p.costs };
+  const setAmt = (k, v) => { if (v !== null && v !== undefined && num(v) > 0) c[k] = { ...c[k], amount: num(v) }; };
+  setAmt("audit", (num(r.audit) || 0) + (num(r.reaudit) || 0) || null);
+  setAmt("vpat", r.vpat);
+  setAmt("pdf", r.pdf);
+  if (r.devHours !== null && r.devHours !== undefined) c.dev = { ...c.dev, hours: num(r.devHours) };
+  if (r.pmHours !== null && r.pmHours !== undefined) c.pm = { ...c.pm, hours: num(r.pmHours) };
+  const out = { ...p, costs: c, deliveredAt: p.deliveredAt || r.deliveredAt || "", lastReplyNote: r.note || "" };
+  await upsertProject(out);
+  return out;
+}
+app.post("/api/projects/:id/ingest", wrap(async (req, res) => {
+  const p = (await listProjects()).find((x) => x.id === req.params.id);
+  if (!p) return res.status(404).json({ error: "No such project" });
+  res.json(await ingestReplies(p));
+}));
 
 /* ---------------------------------------------------------- AI + mail */
 app.post("/api/parse", upload.single("file"), wrap(async (req, res) => {
@@ -74,9 +140,13 @@ app.post("/api/projects/:id/find-invoices", wrap(async (req, res) => {
   res.json(await findInvoicesInGmail(p));
 }));
 
-app.post("/api/reconcile", wrap(async (req, res) => {
-  const [projects, settings] = await Promise.all([listProjects(), getKV("settings", DEFAULT_SETTINGS)]);
-  const s = { ...DEFAULT_SETTINGS, ...settings };
+app.get("/api/projects/:id/chartmogul", wrap(async (req, res) => {
+  const p = (await listProjects()).find((x) => x.id === req.params.id);
+  res.json(await chartmogulMrr(p.client));
+}));
+
+async function reconcileAll() {
+  const [projects, s] = await Promise.all([listProjects(), settings()]);
   const open = [];
   for (const p of projects) {
     const n = pnl(p, s);
@@ -86,63 +156,57 @@ app.post("/api/reconcile", wrap(async (req, res) => {
   }
   const payments = await incomingPayments(45);
   const result = await matchPayments(payments, open);
-  await setKV("settings", { ...s, lastReconcile: new Date().toISOString().slice(0, 10) });
-  res.json({ ...result, paymentsSeen: payments.length });
-}));
-
-app.post("/api/team/draft", wrap(async (req, res) => {
-  const [projects, settings] = await Promise.all([listProjects(), getKV("settings", DEFAULT_SETTINGS)]);
-  const s = { ...DEFAULT_SETTINGS, ...settings };
-  const member = s.team.find((t) => t.id === req.body.memberId);
-  if (!member?.email) return res.status(400).json({ error: "Add an email address for that person first." });
-  const mail = weeklyEmail(member, projects);
-  const id = await createGmailDraft({ to: member.email, ...mail });
-  await setKV("settings", { ...s, lastTimesheetRun: new Date().toISOString().slice(0, 10) });
-  res.json({ ok: true, draftId: id });
-}));
+  await setKV("settings", { ...s, lastReconcile: today() });
+  return { ...result, paymentsSeen: payments.length };
+}
+app.post("/api/reconcile", wrap(async (req, res) => res.json(await reconcileAll())));
 
 /* --------------------------------------------------- Monday morning job */
 async function mondayRun() {
+  const lines = [];
   try {
-    const [projects, settings] = await Promise.all([listProjects(), getKV("settings", DEFAULT_SETTINGS)]);
-    const s = { ...DEFAULT_SETTINGS, ...settings };
-    const lines = [];
+    const s = await settings();
+    let projects = await listProjects();
 
-    /* 1. team check-ins go out as drafts, you press send */
-    for (const m of s.team) {
-      if (!m.email) continue;
-      try { await createGmailDraft({ to: m.email, ...weeklyEmail(m, projects) }); lines.push(`Draft ready for ${m.name}`); }
-      catch (e) { lines.push(`Could not draft for ${m.name}: ${e.message}`); }
+    /* 1. read supplier replies into the P&L */
+    for (const p of projects) {
+      if (p.closed || !p.requests || Object.keys(p.requests).length === 0) continue;
+      try { const u = await ingestReplies(p); if (u.lastReplyNote) lines.push(`${p.client}: ${u.lastReplyNote}`); }
+      catch (e) { lines.push(`${p.client}: could not read replies, ${e.message}`); }
+    }
+    projects = await listProjects();
+
+    /* 2. nudge Cas for hours on anything open and not yet delivered */
+    for (const p of projects) {
+      if (p.closed || p.deliveredAt) continue;
+      await sendSupplierRequests({ ...p, requests: { ...(p.requests || {}), cas: undefined } }, s, ["cas"]);
     }
 
-    /* 2. reminders summary */
+    /* 3. payments */
+    try {
+      const r = await reconcileAll();
+      lines.push("", `Payments: ${r.paymentsSeen} seen, ${(r.matches || []).length} look like a match. Confirm them in the app.`);
+    } catch (e) { lines.push("", `Payment check failed: ${e.message}`); }
+
+    /* 4. open items */
     const tasks = projects.flatMap((p) => tasksFor(p, s));
     lines.push("", tasks.length ? "Open items:" : "No open items.");
     for (const t of tasks) lines.push(`- ${t.title} (${t.project.client})`);
 
-    /* 3. payments landed since last week */
-    try {
-      const pays = await incomingPayments(8);
-      lines.push("", pays.length ? "Payments in the last 8 days:" : "No incoming payments in the last 8 days.");
-      for (const p of pays) lines.push(`- ${p.date} ${p.source} ${p.amount} ${p.currency} from ${p.from}`);
-    } catch (e) { lines.push("", `Payment check failed: ${e.message}`); }
-
     if (process.env.OWNER_EMAIL) {
       await sendGmail({ to: process.env.OWNER_EMAIL, subject: "Ledger: Monday summary", body: lines.join("\n") });
     }
-    await setKV("settings", { ...s, lastTimesheetRun: new Date().toISOString().slice(0, 10) });
+    await setKV("settings", { ...s, lastMonday: today() });
   } catch (e) {
     console.error("monday job failed", e);
   }
+  return lines;
 }
 cron.schedule("0 8 * * 1", mondayRun, { timezone: process.env.TZ || "Asia/Bangkok" });
-app.post("/api/run-monday-now", wrap(async (req, res) => { await mondayRun(); res.json({ ok: true }); }));
+app.post("/api/run-monday-now", wrap(async (req, res) => res.json({ lines: await mondayRun() })));
 
 /* ---------------------------------------------------------- static */
 app.get("/", (req, res) => res.sendFile(path.join(__dirname, "index.html")));
 
 const port = process.env.PORT || 8080;
 migrate().then(() => app.listen(port, () => console.log(`ledger on :${port}`)));
-
-/* health check target and direct visits */
-app.get("/login.html", (req, res) => res.sendFile(path.join(__dirname, "login.html")));
